@@ -1,0 +1,17 @@
+{
+  "grok_api_base_url": "http://localhost:8317/v1",
+  "model": "grok-4.7-build-fast",
+  "reasoning_effort": "xhigh",
+  "timeout_seconds": 360,
+  "scan_samples": 12,
+  "review_samples": 10,
+  "sample_width": 640,
+  "max_repairs": 2,
+  "source_budget_seconds": 1800,
+  "planning_budget_seconds": 600,
+  "max_mask_replans": 3,
+  "max_coverage_replans": 2,
+  "gpu_pixel_search": true,
+  "repair_radius_frames": 18,
+  "max_url_p95": 0.08
+}

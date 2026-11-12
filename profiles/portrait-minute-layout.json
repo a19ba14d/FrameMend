@@ -1,0 +1,16 @@
+{
+  "template_frames": 120,
+  "region": [0, 478, 1080, 704],
+  "mask_region": [0, 502, 1080, 652],
+  "age_regions": [
+    [26, 54, 382, 506, 226, 568],
+    [54, 58, 344, 754, 410, 384]
+  ],
+  "hold_mask": [74, 120],
+  "include_green": true,
+  "dark_until": 62,
+  "dilation": 10,
+  "feather": 5,
+  "scale": 0.46,
+  "split_at_cuts": true
+}
