@@ -1,6 +1,6 @@
-# 本地 GPU 视频去水印
+# FrameMend
 
-这套工具使用 Python、FFmpeg 和 NVIDIA GPU 跟踪并修复视频水印。工作流从 JSON 配方读取处理步骤，输出修复后的视频，以及对画面尺寸、时间戳、音频和水印的检查报告。
+FrameMend 是一套本地 GPU 视频去水印工具，使用 Python、FFmpeg 和 NVIDIA GPU 跟踪并修复视频水印。工作流从 JSON 配方读取处理步骤，输出修复后的视频，以及对画面尺寸、时间戳、音频和水印的检查报告。
 
 ## 安装
 
