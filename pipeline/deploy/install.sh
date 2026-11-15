@@ -15,7 +15,7 @@ fi
 mkdir -p "$root/tools"
 ln -sfn "$root/tools" "$target/.watermark-tools"
 ln -sfn "$target" "$root/app.new" && mv -T "$root/app.new" "$root/app"
-WATERMARK_VENV=$root/venv WATERMARK_TOOLS_DIR=$root/tools "$root/app/setup.sh" --propainter
+WATERMARK_VENV=$root/venv WATERMARK_TOOLS_DIR=$root/tools bash "$root/app/setup.sh" --propainter
 install -m 755 "$root/app/pipeline/deploy/framemend-guard" "$root/bin/framemend-guard"
 install -m 755 "$root/app/pipeline/deploy/framemend-ctl" /usr/local/bin/framemend-ctl
 install -m 644 "$root/app/pipeline/deploy/framemend-queue.service" /etc/systemd/system/framemend-queue.service
