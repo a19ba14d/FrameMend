@@ -30,6 +30,9 @@ else:
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch.object(fp, "needs_normalizing", return_value=(False, "30"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         self.downloads = base / "crawler/lizhi/downloads"
@@ -145,6 +148,17 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(self.cfg.binding_path("lizhi", "530", 1).is_file())
 
     # ------------------------------------------------------------------ queue
+
+    def test_normalize_skips_conforming_input_and_rewrites_vfr(self):
+        with patch.object(fp, "needs_normalizing", return_value=(False, "30")):
+            video = Path(self.tmp.name) / "a.mp4"
+            self.assertEqual(fp.normalize(self.cfg, video, Path(self.tmp.name) / "job"), video)
+        with patch.object(fp, "needs_normalizing", return_value=(True, "30/1")), \
+                patch.object(fp.subprocess, "run") as run:
+            out = fp.normalize(self.cfg, video, Path(self.tmp.name) / "job")
+        command = run.call_args[0][0]
+        self.assertEqual(command[command.index("-r") + 1], "30/1")
+        self.assertEqual(out, Path(self.tmp.name) / "job-input.mp4")
 
     def test_queue_processes_hottest_episode_first_and_keeps_output(self):
         with patch.object(fp, "output_matches", return_value=None):

@@ -99,6 +99,7 @@ class Config:
         self.tool = str(data.get("tool") or ("framemend@" + version if version else "framemend"))[:64]
         self.keep_days = float(data.get("keep_days", 2))
         self.ffprobe = str(data.get("ffprobe") or shutil.which("ffprobe") or "ffprobe")
+        self.ffmpeg = str(data.get("ffmpeg") or shutil.which("ffmpeg") or "ffmpeg")
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":
@@ -225,12 +226,67 @@ def output_matches(original: Path, result: Path, tool: str = "ffprobe") -> str |
     return None
 
 
+def needs_normalizing(path: Path, tool: str = "ffprobe") -> tuple[bool, str]:
+    """Mirror wm_media.Video.open's input rules; return (needed, target frame rate)."""
+    try:
+        out = subprocess.run(
+            [tool, "-v", "error", "-select_streams", "v:0", "-show_streams", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=120, check=True,
+        ).stdout
+        stream = (json.loads(out).get("streams") or [{}])[0]
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return True, "30"
+    rate = str(stream.get("r_frame_rate") or "30/1")
+    try:
+        num, den = (int(x) for x in rate.split("/"))
+        fps = num / den if den else 0
+    except ValueError:
+        fps = 0
+    if not 1 <= fps <= 120:
+        rate = "30"
+    rotated = any(int(float(d.get("rotation", 0) or 0)) % 360 for d in stream.get("side_data_list", []) or [])
+    ok = (
+        stream.get("pix_fmt") == "yuv420p"
+        and not int(stream.get("width", 1)) % 2 and not int(stream.get("height", 1)) % 2
+        and stream.get("field_order") in (None, "unknown", "progressive")
+        and stream.get("color_range") in (None, "unknown", "tv")
+        and str(stream.get("r_frame_rate")) == str(stream.get("avg_frame_rate"))
+        and str(stream.get("nb_frames", "")).isdigit()
+        and not rotated
+    )
+    return not ok, rate
+
+
+def normalize(cfg: Config, video: Path, job: Path) -> Path:
+    """FrameMend wants constant-rate, even-sized, limited-range yuv420p; many sources are slightly VFR."""
+    needed, rate = needs_normalizing(video, cfg.ffprobe)
+    if not needed:
+        return video
+    target = job.parent / f"{job.name}-input.mp4"
+    command = [
+        cfg.ffmpeg, "-hide_banner", "-v", "error", "-y", "-i", str(video),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p,setsar=1",
+        "-fps_mode", "cfr", "-r", rate,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "14", "-color_range", "tv",
+        "-c:a", "copy", "-movflags", "+faststart", str(target),
+    ]
+    subprocess.run(command, check=True, timeout=cfg.timeout, capture_output=True)
+    return target
+
+
 def run_framemend(cfg: Config, video: Path, job: Path, dilation: int | None) -> dict[str, Any]:
-    command = [cfg.python, str(cfg.app / "wm_auto.py"), str(video), str(job)]
-    if dilation:
-        command += ["--dilation", str(dilation)]
     job.parent.mkdir(parents=True, exist_ok=True)
     started = now()
+    try:
+        source = normalize(cfg, video, job)
+    except (OSError, subprocess.SubprocessError) as error:
+        stderr = getattr(error, "stderr", b"") or b""
+        return {"status": "failed", "error": f"规范化输入失败：{error} {stderr[-300:].decode(errors='replace')}".strip(),
+                "exit_code": -2, "wall_seconds": round(now() - started, 1)}
+    command = [cfg.python, str(cfg.app / "wm_auto.py"), str(source), str(job)]
+    if dilation:
+        command += ["--dilation", str(dilation)]
     try:
         with (job.parent / f"{job.name}.log").open("ab") as handle:
             completed = subprocess.run(command, cwd=cfg.app, stdout=handle, stderr=subprocess.STDOUT,
@@ -238,6 +294,8 @@ def run_framemend(cfg: Config, video: Path, job: Path, dilation: int | None) -> 
         code = completed.returncode
     except subprocess.TimeoutExpired:
         code = -1
+    if source != video:
+        source.unlink(missing_ok=True)
     report = read_json(job / "auto.json")
     report.setdefault("status", "failed")
     report["exit_code"] = code

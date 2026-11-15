@@ -3,6 +3,7 @@
   "app": "/srv/framemend/app",
   "python": "/srv/framemend/venv/bin/python",
   "ffprobe": "/usr/bin/ffprobe",
+  "ffmpeg": "/usr/bin/ffmpeg",
   "api_url": "https://api.1ybox.com/api",
   "api_key_file": "/srv/produced/produced.key",
   "enabled_sources": [],
