@@ -1,0 +1,4 @@
+#!/bin/sh
+# framemend-ctl status | mark | cleanup | pause | resume | release <源> <剧ID> [集] | retry <源> <剧ID> [集]
+export FRAMEMEND_CONFIG="${FRAMEMEND_CONFIG:-/srv/framemend/config.json}"
+exec /usr/bin/python3 -I /srv/framemend/app/pipeline/framemend_pipeline.py "$@"

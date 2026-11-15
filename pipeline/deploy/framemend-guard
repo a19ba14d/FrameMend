@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installed as PRODUCED_WORKER by the "# framemend-entry-v1" block in /srv/produced/bin/produced-<源>-local.sh.
+# FRAMEMEND_REAL_WORKER must point at the worker this replaced.
+export FRAMEMEND_CONFIG="${FRAMEMEND_CONFIG:-/srv/framemend/config.json}"
+exec /usr/bin/python3 -I /srv/framemend/app/pipeline/framemend_pipeline.py guard "$@"

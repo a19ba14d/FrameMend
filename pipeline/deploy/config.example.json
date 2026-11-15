@@ -1,0 +1,27 @@
+{
+  "root": "/srv/framemend",
+  "app": "/srv/framemend/app",
+  "python": "/srv/framemend/venv/bin/python",
+  "ffprobe": "/usr/bin/ffprobe",
+  "api_url": "https://api.1ybox.com/api",
+  "api_key_file": "/srv/produced/produced.key",
+  "enabled_sources": [],
+  "min_size": 300000,
+  "settle_seconds": 600,
+  "episode_timeout": 14400,
+  "retry_dilation": 8,
+  "keep_days": 2,
+  "sources": {
+    "badnews": "/srv/crawler/badnews/downloads",
+    "chengguo": "/srv/crawler/chengguo/downloads",
+    "chiguo": "/srv/crawler/chiguo/downloads",
+    "crdjai91": "/srv/crawler/crdjai91/downloads",
+    "huangdou": "/srv/crawler/huangdou/downloads",
+    "huangguocom": "/srv/crawler/huangguocom/downloads",
+    "lizhi": "/srv/crawler/lizhi/downloads",
+    "rou": "/srv/crawler/rou/downloads",
+    "shuguo": "/srv/crawler/shuguo/downloads",
+    "yeguo": "/srv/crawler/yeguo/downloads",
+    "youzi": "/srv/crawler/youzi/downloads"
+  }
+}

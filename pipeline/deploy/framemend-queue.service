@@ -1,0 +1,20 @@
+[Unit]
+Description=FrameMend 高热剧逐集去水印队列（并给已发布的成品在中台打标记）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FRAMEMEND_CONFIG=/srv/framemend/config.json
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -I /srv/framemend/app/pipeline/framemend_pipeline.py queue
+Restart=on-failure
+RestartSec=30
+Nice=15
+IOSchedulingClass=idle
+UMask=0077
+StandardOutput=append:/var/log/framemend-queue.log
+StandardError=append:/var/log/framemend-queue.log
+
+[Install]
+WantedBy=multi-user.target
