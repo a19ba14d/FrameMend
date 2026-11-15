@@ -141,7 +141,8 @@ def processing(args):
             frames = restore_frames(video, track, start, stop, cuda, args.model_scale, args.raft_iterations, args.model_dir,
                                     consensus=config['discovery'].get('consensus_mask', False),
                                     separate_jumps=config['discovery'].get('separate_jumps', False),
-                                    edge_layer=config['discovery'].get('edge_repair', {}).get('layer'))
+                                    edge_layer=config['discovery'].get('edge_repair', {}).get('layer'),
+                                    area_limit=config['discovery'].get('area_limit', .16))
     else:
         frames = inverse_frames(video, matte, start, stop, cuda)
     with render_slot, encode(video, args.output, start, stop, args.cq) as stream:
@@ -215,8 +216,10 @@ def verify(source, output, report):
     original, restored = Video.open(source), Video.open(output)
     original.check_timestamps()
     restored.check_timestamps()
-    same_video = (original.width, original.height, original.fps, original.count, original.offset) == (
-        restored.width, restored.height, restored.fps, restored.count, restored.offset)
+    # The output's 90 kHz ticks place a source's video start to within one tick (and ffprobe prints microseconds).
+    same_video = (original.width, original.height, original.fps, original.count) == (
+        restored.width, restored.height, restored.fps, restored.count) and \
+        abs(original.offset-restored.offset) <= 1/90000+1e-6
     streams = []
     for path in (original.path, restored.path):
         data = probe(path, '-select_streams', 'a', '-show_packets', '-show_data_hash', 'SHA256',

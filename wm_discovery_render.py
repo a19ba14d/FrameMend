@@ -28,8 +28,8 @@ def put_mask(canvas, mask, x, y):
     np.maximum(view, mask[section], out=view)
 
 
-def verify_mask_area(video, layers, start, stop):
-    limit = .16*video.width*video.height
+def verify_mask_area(video, layers, start, stop, share=.16):
+    limit = share*video.width*video.height
     upper = np.zeros(stop-start, dtype=np.int64)
     for mask, _, present in layers:
         upper[present[start:stop]] += np.count_nonzero(mask)
@@ -78,6 +78,77 @@ def context_groups(video, active_layers, *, separate_jumps=False):
                 members.extend(prior)
             groups.append(((x, y, right, bottom), members))
     return groups
+
+
+# A window of the repair sees the scene only through its own frames. Where marks cover the same place in all of them
+# (a badge that has just finished animating in, say) the model has nothing there to carry over and makes a fill up
+# from the edges, a smear of the badge's own glow. Frames of the same shot outside the window that show that place
+# go in as references, nearest first. A lent frame is the scene itself or it does harm: whatever of a mark it shows
+# unmasked is copied in. So it must show the whole hidden place with no mark on it or beside it, be well away from
+# any frame where one is (the frames by a mark's entrance are its animation, the least sure of its masks), and the
+# marks that hide the place must leave no trace of their pattern there.
+CLEAN_SHARE = .05   # share of a window's masked area hidden in all its frames from which references are sought
+CLEAN_REACH = 96    # frames searched on each side of the window, within its shot
+CLEAN_GUARD = 1.    # seconds a lent frame keeps from any frame with a mark on or beside the hidden place
+CLEAN_BESIDE = 16   # pixels around the hidden place that must be free of marks too
+CLEAN_TRACE = .12   # template score at which a mark counts as showing although it was not found present
+CLEAN_WIDEN = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+
+def group_mask(members, frame, region):
+    x, y, w, h = region
+    canvas = np.zeros((h, w), np.uint8)
+    for mask, positions, present in members:
+        if present[frame]:
+            left, top = map(int, positions[frame])
+            put_mask(canvas, mask, left-x, top-y)
+    return canvas
+
+
+def touching(layer, frames, rect):
+    """Whether the layer is shown with its box meeting rect = (x, y, right, bottom), per frame."""
+    mask, positions, present = layer
+    h, w = mask.shape
+    x, y, right, bottom = rect
+    left, top = positions[frames, 0], positions[frames, 1]
+    return present[frames] & (left < right) & (left+w > x) & (top < bottom) & (top+h > y)
+
+
+def clean_references(layers, scores, region, masks, window, shot, guard):
+    """Frames of the shot outside the window [first, end) that show what the window's masks hide in all its frames:
+    the nearest before and after it, with their own masks, [(frame, mask)]. Layers and their template scores (None
+    where unknown) span the whole video. A lent frame's mask is widened a little: a glow just outside a mark is worse
+    to copy in than a little less background."""
+    hidden = (masks > 0).all(axis=0)
+    total = int(hidden.sum())
+    if total < 64 or total < CLEAN_SHARE*int((masks > 0).any(axis=0).sum()):
+        return []
+    (first, end), (lo, hi) = window, shot
+    x, y, _, _ = region
+    bx, by, bw, bh = cv2.boundingRect(hidden.astype(np.uint8))
+    near = (x+bx-CLEAN_BESIDE, y+by-CLEAN_BESIDE, x+bx+bw+CLEAN_BESIDE, y+by+bh+CLEAN_BESIDE)
+    start, stop = max(lo, first-CLEAN_REACH-guard), min(hi, end+CLEAN_REACH+guard)
+    frames = np.arange(start, stop)
+    occupied = np.zeros(len(frames), bool)
+    hiding = []
+    for number, layer in enumerate(layers):
+        meets = touching(layer, frames, near)
+        occupied |= meets
+        trace = scores[number]
+        if meets[first-start:end-start].any() and trace is not None and np.shape(trace) == (len(layer[1]),):
+            hiding.append(np.asarray(trace[start:stop], np.float32))
+    # Frames within the guard of a frame with a mark there (the window's own frames among them) are left out.
+    blocked = np.convolve(occupied.astype(np.int32), np.ones(2*guard+1, np.int32))[guard:guard+len(frames)] > 0
+    for trace in hiding:
+        blocked |= np.nan_to_num(trace, nan=0.) >= CLEAN_TRACE
+    chosen = []
+    before = [f for f in range(first-1, max(lo, first-CLEAN_REACH)-1, -1) if not blocked[f-start]]
+    after = [f for f in range(end, min(hi, end+CLEAN_REACH)) if not blocked[f-start]]
+    for side in (before, after):
+        if side:
+            f = side[0]
+            chosen.append((f, cv2.dilate(group_mask(layers, f, region), CLEAN_WIDEN)))
+    return sorted(chosen, key=lambda item: item[0])
 
 
 def visual_signatures(video, track, cuda, consensus=False):
@@ -799,7 +870,7 @@ class ReferencePatches:
 
 
 def restore_frames(video, track, start, stop, cuda, scale, raft_iterations, model_dir=None, *, consensus=False,
-                   separate_jumps=False, edge_layer=None):
+                   separate_jumps=False, edge_layer=None, area_limit=.16):
     layers = [(mask, layer['positions'], layer.get('present', np.ones(video.count, bool)))
               for layer, _, mask in layer_masks(video, track, cuda, consensus, edge_layer)]
     luma = luma_extent_proofs(video, track)
@@ -814,9 +885,17 @@ def restore_frames(video, track, start, stop, cuda, scale, raft_iterations, mode
             if extent.registered:
                 references[id(extent.mask)] = extent, layers[extent.layer][2] & tracked[extent.layer]['verified']
     layers.extend((extent.mask, extent.positions, extent.present) for extent in luma)
-    verify_mask_area(video, layers, start, stop)
-    cuts = track['cuts']
-    cuts = cuts[(cuts > start)&(cuts < stop)]-start
+    verify_mask_area(video, layers, start, stop, area_limit)
+    every = np.asarray(track['cuts'], np.int64)
+    cuts = every[(every > start)&(every < stop)]-start
+
+    def shot(frame):
+        k = int(np.searchsorted(every, frame, side='right'))
+        return int(every[k-1]) if k else 0, int(every[k]) if k < len(every) else video.count
+    scores = [layer.get('scores') for layer in discovery_tracks(track)]
+    scores += [None]*(len(layers)-len(scores))
+    guard = max(1, round(CLEAN_GUARD*float(video.fps)))
+    pictures, borrowed = {}, Counter()
     model = None
     source = iter(read_frames(video, start, stop, cuda))
     buffer = []
@@ -849,7 +928,26 @@ def restore_frames(video, track, start, stop, cuda, scale, raft_iterations, mode
             model.scale = min(scale, (108000/(w*h))**.5)
             context = luma_reference_masks(video, buffer, masks, members, (x, y), references,
                                            parents=parents) if references else masks
-            predicted = model.predict(rgb, context)
+            # A lent frame is masked with every layer, not only this window's: a part that is shown there but not
+            # here (an icon flying in before the mark) is still the watermark.
+            extra = clean_references(layers, scores, region, masks, (start+first, start+end), shot(start+first),
+                                     guard)
+            if extra:
+                for f, _ in extra:
+                    if f not in pictures:
+                        pictures[f] = get_frame(video, f, cuda)
+                    borrowed[f] += 1
+                before = [(f, m) for f, m in extra if f < start+first]
+                after = [(f, m) for f, m in extra if f >= start+end]
+                shown = lambda items: [yuv_to_rgb(plane_rects(video.planes(pictures[f]), region), video.matrix)
+                                       for f, _ in items]
+                clip = np.stack([*shown(before), *rgb, *shown(after)])
+                holes = np.stack([*(m for _, m in before), *context, *(m for _, m in after)])
+                lead = len(before)
+                predicted = model.predict(clip, holes, [*range(lead), *range(lead+len(rgb), len(clip))])
+                predicted = predicted[lead:lead+len(rgb)]
+            else:
+                predicted = model.predict(rgb, context)
             for offset in active_outputs:
                 if offset not in restored:
                     restored[offset] = buffer[offset][1].copy()
@@ -858,7 +956,14 @@ def restore_frames(video, track, start, stop, cuda, scale, raft_iterations, mode
         for offset in outputs:
             i, original = buffer[offset]
             yield i, restored.get(offset, original)
+        # A reference is wanted again only by the next windows of its shot.
+        for f in [f for f in pictures if f < start+first-CLEAN_REACH]:
+            del pictures[f]
     next(source, None)
+    if borrowed:
+        lent = sorted(borrowed)
+        print(f'Clean references: {len(lent)} frames lent to {sum(borrowed.values())} window regions: '
+              f'{lent[:12]}{" ..." if len(lent) > 12 else ""}', flush=True)
 
 
 def summarize_layer(layer, motif, color, mask, present, residuals, color_residuals):
@@ -941,7 +1046,7 @@ def audit_discovery(source, output, profile_path, workdir, report_path, cuda):
     if 'matte_positions' not in track:
         edits = [(mask, layer['positions'], present) for layer, _, _, mask, present, _, _ in layers]
         edits.extend((extent.mask, extent.positions, extent.present) for extent in luma)
-        verify_mask_area(source, edits, 0, source.count)
+        verify_mask_area(source, edits, 0, source.count, settings.get('area_limit', .16))
     outside, absent_changes = [], []
     step = max(1, source.count//45)
     streams = zip(read_frames(source, cuda=cuda), read_frames(output, cuda=cuda), strict=True)

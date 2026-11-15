@@ -6,6 +6,7 @@ import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -14,6 +15,10 @@ from wm_runtime import check_budget, bounded_timeout, current_runtime
 
 
 ROOT = Path(__file__).resolve().parent
+READ_RETRIES = 2    # restarts of a decoder that stopped short at one frame before the read fails
+# Frames between two wanted ones that are decoded and passed over rather than starting another decoder for the second:
+# starting one (the more so with CUDA) takes as long as decoding a few hundred frames in a row.
+READ_GAP = 150
 
 
 def tools_directory(root):
@@ -29,15 +34,24 @@ def tools_directory(root):
 TOOLS = tools_directory(ROOT)
 
 
+@lru_cache(maxsize=None)
+def _installed(name):
+    # Looked up once per process: every read of frames starts a decoder, and walking the tools folder is slow where
+    # it lies on a shared drive.
+    # setup.ps1 and setup.sh unpack their builds side by side; each platform takes only its own.
+    suffix = '.exe' if os.name == 'nt' else ''
+    for path in sorted(TOOLS.glob(f'ffmpeg-*/bin/{name}{suffix}'), reverse=True):
+        return str(path)
+    return shutil.which(name)
+
+
 def executable(name):
     configured = os.environ.get(f'WATERMARK_{name.upper()}')
     if configured:
         return configured
-    for path in sorted(TOOLS.glob(f'ffmpeg-*/bin/{name}.exe'), reverse=True):
-        return str(path)
-    path = shutil.which(name)
+    path = _installed(name)
     if path is None:
-        raise ValueError(f'{name} not found. Run setup.ps1 or set WATERMARK_{name.upper()}.')
+        raise ValueError(f'{name} not found. Run setup.ps1 (Windows) or setup.sh (Linux) or set WATERMARK_{name.upper()}.')
     return path
 
 
@@ -64,6 +78,7 @@ class Video:
     matrix: str
     transfer: str
     primaries: str
+    start: float = 0.   # where the file's timeline starts (an empty edit before every stream when positive)
 
     @classmethod
     def open(cls, path):
@@ -88,10 +103,11 @@ class Video:
         transfer = video.get('color_transfer', 'unknown')
         if matrix not in ('bt709', 'bt470bg', 'smpte170m') or transfer in ('smpte2084', 'arib-std-b67'):
             raise ValueError('Use an SDR BT.709 or BT.601 source.')
-        offset = float(video.get('start_time', '0')) - float(info['format'].get('start_time', '0'))
+        start = float(info['format'].get('start_time', '0'))
+        offset = float(video.get('start_time', '0')) - start
         sar = video.get('sample_aspect_ratio') or '1:1'
         return cls(path, width, height, fps, int(video['nb_frames']), offset, sar,
-                   matrix, transfer, video.get('color_primaries', 'unknown'))
+                   matrix, transfer, video.get('color_primaries', 'unknown'), start)
 
     def check_timestamps(self):
         info = probe(self.path, '-select_streams', 'v:0', '-show_packets', '-show_entries', 'packet=pts_time')
@@ -138,12 +154,6 @@ def read_frames(video, start=0, stop=None, cuda=True, *, size=None, step=1):
     if (type(step) is not int or step < 1 or not 2 <= width <= video.width or not 2 <= height <= video.height
             or width % 2 or height % 2):
         raise ValueError('Sampling needs an even in-frame resolution and a positive frame step.')
-    cmd = [executable('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-nostdin', '-xerror']
-    if start:
-        cmd += ['-ss', _seek_time(video, start)]
-    if cuda:
-        cmd += ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda']
-    cmd += ['-noautorotate', '-i', str(video.path), '-map', '0:v:0']
     filters = []
     if step > 1:
         filters.append(f'select=not(mod(n\\,{step}))')
@@ -151,25 +161,43 @@ def read_frames(video, start=0, stop=None, cuda=True, *, size=None, step=1):
         filters.append(f'scale_cuda={width}:{height}:interp_algo=bilinear' if cuda else f'scale={width}:{height}:flags=area')
     if cuda:
         filters.extend(('hwdownload', 'format=nv12', 'format=yuv420p'))
-    if filters:
-        cmd += ['-vf', ','.join(filters)]
     indices = range(start, stop, step)
-    cmd += ['-frames:v', str(len(indices)), '-fps_mode', 'passthrough', '-pix_fmt', 'yuv420p',
-            '-c:v', 'rawvideo', '-threads:v', '1', '-f', 'rawvideo', 'pipe:1']
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE) as process:
-        frame_size = width * height * 3 // 2
-        try:
-            for index in indices:
-                check_budget()
-                frame = bytearray(frame_size)
-                if process.stdout.readinto(frame) != frame_size:
-                    raise RuntimeError(f'FFmpeg stopped decoding at frame {index}.')
-                yield index, np.frombuffer(frame, dtype=np.uint8)
-            if process.wait():
-                raise RuntimeError('FFmpeg decoder failed.')
-        finally:
-            if process.poll() is None:
-                process.terminate()
+    frame_size = width * height * 3 // 2
+    # A read of the file can go wrong once (a network or shared drive under load hands the demuxer bad bytes) and
+    # the same frames decode on the next try: the decoder is restarted at the frame it stopped at, a few times.
+    position, failed_at, failures = 0, None, 0
+    while True:
+        first = indices[position]
+        cmd = [executable('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-nostdin', '-xerror']
+        if first:
+            cmd += ['-ss', _seek_time(video, first)]
+        if cuda:
+            cmd += ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda']
+        cmd += ['-noautorotate', '-i', str(video.path), '-map', '0:v:0']
+        if filters:
+            cmd += ['-vf', ','.join(filters)]
+        cmd += ['-frames:v', str(len(indices)-position), '-fps_mode', 'passthrough', '-pix_fmt', 'yuv420p',
+                '-c:v', 'rawvideo', '-threads:v', '1', '-f', 'rawvideo', 'pipe:1']
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE) as process:
+            try:
+                while position < len(indices):
+                    check_budget()
+                    frame = bytearray(frame_size)
+                    if process.stdout.readinto(frame) != frame_size:
+                        break
+                    yield indices[position], np.frombuffer(frame, dtype=np.uint8)
+                    position += 1
+                else:
+                    if process.wait():
+                        raise RuntimeError('FFmpeg decoder failed.')
+                    return
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+        failures = failures+1 if failed_at == position else 1
+        failed_at = position
+        if failures > READ_RETRIES:
+            raise RuntimeError(f'FFmpeg stopped decoding at frame {indices[position]}.')
 
 
 def get_frame(video, index, cuda=True):
@@ -199,6 +227,20 @@ def get_frame(video, index, cuda=True):
             runtime.frames[key] = result.copy()
             runtime.frame_bytes += result.nbytes
     return result
+
+
+def read_selected(video, indices, cuda=True, *, gap=READ_GAP):
+    """Yield (index, frame) for the given frames, in ascending order. Frames no more than `gap` apart are read by
+    one decoder, which passes over the frames between them: the frames are the ones get_frame returns for each."""
+    wanted = sorted(set(int(i) for i in indices))
+    first = 0
+    for k in range(1, len(wanted)+1):
+        if k == len(wanted) or wanted[k]-wanted[k-1] > gap:
+            run = set(wanted[first:k])
+            for i, frame in read_frames(video, wanted[first], wanted[k-1]+1, cuda):
+                if i in run:
+                    yield i, frame
+            first = k
 
 
 def yuv_to_rgb(parts, matrix):
@@ -255,13 +297,20 @@ def encode(video, output, start, stop, cq):
     if video.primaries != 'unknown':
         cmd += ['-color_primaries', video.primaries]
     filters = ['settb=1/90000']
-    if start == 0 and video.offset > 0:
-        filters.append(f'setpts=PTS+{round(video.offset * 90000)}')
+    # A file whose timeline starts late (an empty edit before its streams) keeps that start: FFmpeg moves the copied
+    # streams to zero and adds the output offset back, in microseconds rounded to each stream's ticks. The video's
+    # shift is chosen so that it lands on the tick of its own first presentation time.
+    lead = round(max(0., video.start)*1e6) if start == 0 else 0
+    shift = round((lead/1e6+video.offset)*90000)-round(lead*90000/1e6) if start == 0 else 0
+    if shift > 0:
+        filters.append(f'setpts=PTS+{shift}')
     if video.sar not in ('1:1', '0:1', 'N/A'):
         filters.append('setsar=' + video.sar.replace(':', '/'))
     # A small positive presentation offset can be lost when an MP4 with B-frames
     # uses only unsigned composition offsets. Signed offsets retain its empty edit.
     movflags = '+faststart+negative_cts_offsets' if start == 0 and video.offset > 0 else '+faststart'
+    if lead:
+        cmd += ['-output_ts_offset', f'{lead/1e6:.6f}']
     cmd += ['-vf', ','.join(filters), '-movie_timescale', '90000', '-movflags', movflags, str(temporary)]
     try:
         with subprocess.Popen(cmd, stdin=subprocess.PIPE) as process:

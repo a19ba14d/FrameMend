@@ -133,7 +133,8 @@ def build_plan(source, directory, recipe_path, cpu_decode):
         rendered.append(directory/'track-recovered.npz')
     add('render', 'render', [source, final, *common, *shared_render, *final_render, *compositing], rendered)
     add('verify', 'verify', [source, final, '--report', verification], [verification])
-    add('audit', 'audit', [source, final, *common, '--report', audit], [audit])
+    if recipe.get('audit', True) is not False:
+        add('audit', 'audit', [source, final, *common, '--report', audit], [audit])
     for check in recipe.get('animation_checks', []):
         name = check['name']
         report = inside(directory, f'{name}-audit.json')

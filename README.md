@@ -44,6 +44,40 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not generate the test video.' }
 - `restore-grok.ps1` 可以将抽取的视频帧发送给兼容的 Grok API，根据回复生成配方。把 `profiles/grok-director.json` 复制为 `profiles/grok-director.local.json` 后，设置 `grok_api_base_url` 和 `model`，通过环境变量 `WM_GROK_API_KEY` 提供凭据，并用 `-Config` 指向本地配置。
 - `profiles/local-grok-director.json` 还可连接本地视觉模型。使用这个配置时，按文件中的路径准备自己的模型权重、推理程序和 OCR 依赖。
 
+## 自动去水印（无需配方）
+
+`wm_auto.py` 自己找出视频里反复出现的水印文字（角标、移动水印、整幅半透明叠加），学习外形、逐帧跟踪，生成配方后修补，再用 OCR 复查结果；仍有残留时会加大掩码重试。整幅半透明叠加面积太大、无法修补时，按多帧平均画面估计透明度后做反向混合。
+
+移动水印划过烧录字幕时，修补会把被盖住的字一起抹掉。修补后，`wm_auto.py` 用源视频和修补结果拟合这个水印的透明度和颜色，在字幕行内对源画面做反向混合，把白字黑边的字形取回来，写成 `restored.mp4`，作业的 `result.mp4` 指向它。只有和本帧可见字幕连成一行、或者自身够一个完整字的笔画才会取回，画面里零散的高光不会被当成字。加 `--no-captions` 关闭这一步。
+
+Linux 或 WSL2（Ubuntu）上用 `setup.sh` 安装，不需要 sudo：
+
+```bash
+./setup.sh --propainter
+```
+
+Python 环境默认建在 `~/.venvs/framemend`，可用环境变量 `WATERMARK_VENV` 改到别处。在 WSL2 中建议放在 Linux 文件系统里，导入会快很多。
+
+处理单个视频（作业目录必须是新的）。加 `--plan-only` 只生成计划和预览图，不修补；加 `--cpu-decode` 改用 CPU 解码；加 `--audit` 在每次尝试后额外做一遍逐像素审计（默认不做，验收只看 OCR 复查）：
+
+```bash
+~/.venvs/framemend/bin/python wm_auto.py input.mp4 runs/job-1
+```
+
+处理整个目录。中断后用同样的命令继续：已完成的视频会跳过，中断的重新开始；加 `--retry-failed` 重试失败的视频。多块 GPU 时，每块 GPU 启动一个进程并指向同一个作业目录，进程之间按文件加锁分配视频：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ~/.venvs/framemend/bin/python wm_auto.py inputs/ runs/batch &
+CUDA_VISIBLE_DEVICES=1 ~/.venvs/framemend/bin/python wm_auto.py inputs/ runs/batch &
+```
+
+每个视频的结果在 `runs/batch/<视频名>/`：`result.mp4`、`auto.json`（状态、原因、各次尝试）和 `events.jsonl`（逐步记录）。`runs/batch/batch.json` 汇总所有视频。状态含义：
+
+- `complete`：水印已去除，OCR 复查通过。
+- `no_watermark`：没有找到反复出现的水印文字。
+- `needs_review`：已输出结果，但需要人工确认，`reason` 写明原因，例如半透明叠加只被减弱、可能仍有残影。
+- `failed`：处理出错，`error` 写明原因。
+
 ## 命令与测试
 
 ```powershell
