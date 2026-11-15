@@ -10,7 +10,7 @@ This module:
   the same arguments next round) until FrameMend finished them, then hands the clean file to the real worker;
 * ``mark``   - after the worker published a clean episode, tells MediaCMS the video was dewatermarked
   (``POST /v1/produced-submissions/{id}/dewatermark``);
-* ``status`` / ``release`` / ``retry`` / ``pause`` / ``resume`` / ``cleanup`` for operators.
+* ``status`` / ``accept`` / ``release`` / ``retry`` / ``pause`` / ``resume`` / ``cleanup`` for operators.
 
 Nothing here edits crawler downloads or produced-submit state; per-episode state lives under ``<root>/state``.
 Only the standard library is used so the guard starts fast inside produced-submit's loop.
@@ -117,6 +117,9 @@ class Config:
 
     def output_path(self, source: str, drama: str, episode: int) -> Path:
         return self.root / "out" / safe_part(source) / safe_part(drama) / f"{episode:04d}.mp4"
+
+    def candidate_path(self, source: str, drama: str, episode: int) -> Path:
+        return self.root / "review" / safe_part(source) / safe_part(drama) / f"{episode:04d}.mp4"
 
     def binding_path(self, source: str, drama: str, episode: int) -> Path:
         return self.root / "bindings" / safe_part(source) / safe_part(drama) / f"{episode:04d}.json"
@@ -316,6 +319,53 @@ def trim_job(job: Path) -> None:
             entry.unlink(missing_ok=True)
 
 
+def keep_file(result: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(result, temporary)
+    except OSError:
+        shutil.copy2(result, temporary)
+    os.replace(temporary, destination)
+
+
+def residuals_of(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """OCR hits wm_auto still saw in the attempt it published (frame numbers are the result's)."""
+    attempts = [a for a in report.get("attempts") or [] if isinstance(a, dict)]
+    chosen = next((a for a in attempts if a.get("number") == report.get("published_attempt")), None)
+    chosen = chosen or (attempts[-1] if attempts else {})
+    found = []
+    for item in (chosen.get("ocr") or {}).get("residuals") or []:
+        if isinstance(item, dict) and isinstance(item.get("frame"), int):
+            found.append({k: item.get(k) for k in ("frame", "text", "rect", "score", "cause")})
+    return found
+
+
+def snapshot(cfg: Config, video: Path, residual: dict[str, Any], destination: Path) -> Path | None:
+    """Best effort: one frame of the candidate with the OCR hit boxed, for a quick human look."""
+    rect = residual.get("rect") or []
+    box = ""
+    if len(rect) == 4 and all(isinstance(v, (int, float)) for v in rect):
+        x, y, w, h = (int(v) for v in rect)
+        box = f",drawbox=x={x}:y={y}:w={w}:h={h}:color=red:t=4"
+    command = [cfg.ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(video),
+               "-vf", f"select=eq(n\\,{int(residual['frame'])}){box},scale=540:-2", "-frames:v", "1",
+               str(destination)]
+    try:
+        subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=300, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return destination if destination.is_file() else None
+
+
+def drop_candidate(state: dict[str, Any]) -> None:
+    for path in [state.pop("candidate", None), *state.pop("snapshots", [])]:
+        if path:
+            Path(path).unlink(missing_ok=True)
+    state.pop("residuals", None)
+
+
 def process_episode(cfg: Config, source: str, drama: str, number: int, video: Path) -> dict[str, Any]:
     state_path = cfg.state_path(source, drama, number)
     state = read_json(state_path) or {"source": source, "drama": drama, "episode": number, "attempts": []}
@@ -323,6 +373,7 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
     job = cfg.job_dir(source, drama, number) / f"attempt-{attempt:02d}"
     if job.exists():
         shutil.rmtree(job)
+    drop_candidate(state)
     state.update(status=PENDING, original=str(video), running=attempt, updated=now())
     write_json(state_path, state)
     report = run_framemend(cfg, video, job, cfg.retry_dilation if attempt > 1 else None)
@@ -330,29 +381,33 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
     summary = {"attempt": attempt, "status": status, "reason": report.get("reason") or report.get("error"),
                "seconds": report.get("wall_seconds"), "exit_code": report.get("exit_code")}
     state.pop("running", None)
-    if status == "complete":
-        result = Path(report.get("result") or job / "result.mp4").resolve()
+    result = Path(report.get("result") or job / "result.mp4").resolve()
+    if status in ("complete", "needs_review"):
         problem = output_matches(video, result, cfg.ffprobe) if result.is_file() else "找不到成品文件"
         if problem:
             status = summary["status"] = "failed"
             summary["reason"] = problem
-        else:
-            output = cfg.output_path(source, drama, number)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            temporary = output.with_name(f".{output.name}.tmp")
-            temporary.unlink(missing_ok=True)
-            try:
-                os.link(result, temporary)
-            except OSError:
-                shutil.copy2(result, temporary)
-            os.replace(temporary, output)
-            state.update(status=COMPLETE, output=str(output), sha256=sha256(output),
-                         size=output.stat().st_size, tool=cfg.tool, completed=now())
-            trim_job(job)
-    if status == "no_watermark":
+    if status == "complete":
+        output = cfg.output_path(source, drama, number)
+        keep_file(result, output)
+        state.update(status=COMPLETE, output=str(output), sha256=sha256(output),
+                     size=output.stat().st_size, tool=cfg.tool, completed=now())
+        trim_job(job)
+    elif status == "needs_review":
+        # wm_auto's OCR re-check still saw text. That is often scenery read as a letter, so keep the
+        # result for a person to look at (accept / retry / release) instead of burning GPU on retries.
+        candidate = cfg.candidate_path(source, drama, number)
+        keep_file(result, candidate)
+        residuals = residuals_of(report)
+        shots = [snapshot(cfg, candidate, r, candidate.with_name(f"{candidate.stem}-f{r['frame']}.jpg"))
+                 for r in residuals[:3]]
+        state.update(status=REVIEW, candidate=str(candidate), residuals=residuals[:10],
+                     snapshots=[str(p) for p in shots if p])
+        trim_job(job)
+    elif status == "no_watermark":
         state.update(status=NO_WATERMARK)
         trim_job(job)
-    elif status != "complete":
+    else:
         # One retry with a wider mask, then wait for a person (the episode stays held).
         state.update(status=PENDING if attempt < 2 else REVIEW)
     state.setdefault("attempts", []).append(summary)
@@ -642,7 +697,14 @@ def status(cfg: Config) -> dict[str, Any]:
             if attempt.get("status") == "complete" and attempt.get("seconds"):
                 seconds.append(float(attempt["seconds"]))
         if key == REVIEW:
-            review.append(f"{state.get('source')}:{state.get('drama')}:{state.get('episode')}")
+            review.append({
+                "episode": f"{state.get('source')}:{state.get('drama')}:{state.get('episode')}",
+                "reason": (state.get("attempts") or [{}])[-1].get("reason"),
+                "candidate": state.get("candidate"),
+                "residuals": [f"帧{r.get('frame')} 「{r.get('text')}」 {r.get('score')}"
+                              for r in state.get("residuals", [])[:3]],
+                "snapshots": state.get("snapshots", []),
+            })
     waiting = candidates(cfg)
     average = sum(seconds) / len(seconds) if seconds else None
     marks = {"marked": 0, "waiting": 0, "error": 0}
@@ -681,6 +743,7 @@ def release(cfg: Config, source: str, drama: str, episode: int | None) -> int:
             state = read_json(path) or {"source": source, "drama": drama, "episode": number, "attempts": []}
             if state.get("status") in (COMPLETE, NO_WATERMARK, RELEASED):
                 continue
+            drop_candidate(state)
             state.update(status=RELEASED, updated=now(), operator_change=RELEASED)
             write_json(path, state)
             changed += 1
@@ -697,9 +760,32 @@ def set_state(cfg: Config, source: str, drama: str, episode: int | None, status_
             continue
         if state.get("status") not in only:
             continue
+        drop_candidate(state)
+        # Attempts are kept, so a retried episode runs with the wider mask (retry_dilation).
         state.update(status=status_value, updated=now(), operator_change=status_value)
-        if status_value == PENDING:
-            state["attempts"] = []
+        write_json(path, state)
+        changed += 1
+    return changed
+
+
+def accept(cfg: Config, source: str, drama: str, episode: int | None) -> int:
+    """A person looked at the kept result of a review episode and found it clean: submit it."""
+    changed = 0
+    for path, state in all_states(cfg):
+        if state.get("source") != source or str(state.get("drama")) != drama or state.get("status") != REVIEW:
+            continue
+        if episode is not None and int(state.get("episode", -1)) != episode:
+            continue
+        candidate = Path(state.get("candidate") or "")
+        if not candidate.is_file():
+            log("no kept result to accept; use retry or release", source=source, drama=drama,
+                episode=state.get("episode"))
+            continue
+        output = cfg.output_path(source, drama, int(state["episode"]))
+        keep_file(candidate, output)
+        drop_candidate(state)
+        state.update(status=COMPLETE, output=str(output), sha256=sha256(output), size=output.stat().st_size,
+                     tool=cfg.tool, completed=now(), updated=now(), operator_change="accepted")
         write_json(path, state)
         changed += 1
     return changed
@@ -719,8 +805,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("cleanup")
     sub.add_parser("pause")
     sub.add_parser("resume")
-    for name in ("release", "retry"):
-        command = sub.add_parser(name, help="release：待人工的集改投原片；retry：待人工的集重新排队")
+    for name in ("accept", "release", "retry"):
+        command = sub.add_parser(name, help="accept：待人工的集确认干净，投去水印成品；"
+                                            "release：待人工的集改投原片；retry：待人工的集加大掩码重跑")
         command.add_argument("source")
         command.add_argument("drama")
         command.add_argument("episode", nargs="?", type=int)
@@ -740,6 +827,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "resume":
         (cfg.root / "pause").unlink(missing_ok=True)
         result = {"paused": False}
+    elif args.command == "accept":
+        result = {"accepted": accept(cfg, args.source, args.drama, args.episode)}
     elif args.command == "release":
         result = {"released": release(cfg, args.source, args.drama, args.episode)}
     else:

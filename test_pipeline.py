@@ -23,6 +23,12 @@ mode = Path(__file__).with_name("mode").read_text().strip()
 if mode == "complete":
     (job / "result.mp4").write_bytes(b"clean-" + src.read_bytes())
     json.dump({"status": "complete", "result": str(job / "result.mp4")}, open(job / "auto.json", "w"))
+elif mode == "review-result":
+    (job / "result.mp4").write_bytes(b"maybe-" + src.read_bytes())
+    residual = {"frame": 12, "text": "A", "rect": [1, 2, 3, 4], "score": 0.7, "cause": "missed"}
+    json.dump({"status": "needs_review", "reason": "Watermark text remained", "result": str(job / "result.mp4"),
+               "published_attempt": 1, "attempts": [{"number": 1, "ocr": {"residuals": [residual]}}]},
+              open(job / "auto.json", "w"))
 else:
     json.dump({"status": mode, "reason": "test"}, open(job / "auto.json", "w"))
 """
@@ -171,14 +177,50 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(fp.read_json(self.cfg.state_path("lizhi", "531", 1)))
 
     def test_failure_retries_once_then_waits_for_review(self):
-        (self.app / "mode").write_text("needs_review")
+        (self.app / "mode").write_text("failed")
         fp.queue_once(self.cfg)
         self.assertEqual(fp.read_json(self.cfg.state_path("lizhi", "530", 1))["status"], fp.PENDING)
         fp.queue_once(self.cfg)
         state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
         self.assertEqual(state["status"], fp.REVIEW)
         self.assertEqual(len(state["attempts"]), 2)
-        self.assertEqual(fp.status(self.cfg)["review"], ["lizhi:530:1"])
+        self.assertEqual([r["episode"] for r in fp.status(self.cfg)["review"]], ["lizhi:530:1"])
+        self.assertIsNone(fp.status(self.cfg)["review"][0]["candidate"])
+
+    def test_needs_review_keeps_result_for_accept(self):
+        (self.app / "mode").write_text("review-result")
+        with patch.object(fp, "output_matches", return_value=None), \
+                patch.object(fp, "snapshot", side_effect=lambda cfg, v, r, d: d.write_bytes(b"jpg") or d):
+            fp.queue_once(self.cfg)
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual(state["status"], fp.REVIEW)
+        self.assertEqual(len(state["attempts"]), 1)  # no GPU retry for an OCR doubt
+        candidate = Path(state["candidate"])
+        self.assertTrue(candidate.read_bytes().startswith(b"maybe-"))
+        self.assertEqual(state["residuals"][0]["frame"], 12)
+        review = fp.status(self.cfg)["review"][0]
+        self.assertEqual(review["residuals"], ["帧12 「A」 0.7"])
+        self.assertEqual(len(review["snapshots"]), 1)
+        args = self.worker_args("530_Hot", "530", 1)
+        self.assertIsNone(fp.decide(self.cfg, args)[1])
+        self.assertEqual(fp.accept(self.cfg, "lizhi", "530", 1), 1)
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual((state["status"], state["operator_change"]), (fp.COMPLETE, "accepted"))
+        self.assertFalse(candidate.exists())
+        self.assertFalse(Path(review["snapshots"][0]).exists())
+        self.assertEqual(fp.decide(self.cfg, args)[1][args.index("--source") + 1], state["output"])
+        self.assertEqual(state["sha256"], fp.sha256(Path(state["output"])))
+
+    def test_retry_drops_candidate_and_uses_wider_mask(self):
+        (self.app / "mode").write_text("review-result")
+        with patch.object(fp, "output_matches", return_value=None), patch.object(fp, "snapshot", return_value=None):
+            fp.queue_once(self.cfg)
+            candidate = Path(fp.read_json(self.cfg.state_path("lizhi", "530", 1))["candidate"])
+            self.assertEqual(fp.set_state(self.cfg, "lizhi", "530", 1, fp.PENDING, (fp.REVIEW,)), 1)
+            self.assertFalse(candidate.exists())
+            with patch.object(fp, "run_framemend", wraps=fp.run_framemend) as run:
+                fp.queue_once(self.cfg)
+            self.assertEqual(run.call_args.args[3], self.cfg.retry_dilation)
 
     def test_release_lets_held_episodes_go_as_original(self):
         self.assertEqual(fp.release(self.cfg, "lizhi", "530", None), 2)
