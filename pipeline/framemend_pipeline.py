@@ -93,6 +93,7 @@ class Config:
         self.settle_seconds = int(data.get("settle_seconds", 600))
         self.timeout = int(data.get("episode_timeout", 4 * 3600))
         self.retry_dilation = int(data.get("retry_dilation", 8))
+        self.min_coverage = float(data.get("min_coverage", 0.5))
         self.api_url = str(data.get("api_url", "")).rstrip("/")
         self.api_key_file = Path(data.get("api_key_file", "/srv/produced/produced.key"))
         version = (self.app / "VERSION").read_text().strip() if (self.app / "VERSION").is_file() else ""
@@ -330,11 +331,26 @@ def keep_file(result: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def residuals_of(report: dict[str, Any]) -> list[dict[str, Any]]:
-    """OCR hits wm_auto still saw in the attempt it published (frame numbers are the result's)."""
+def published_attempt(report: dict[str, Any]) -> dict[str, Any]:
     attempts = [a for a in report.get("attempts") or [] if isinstance(a, dict)]
     chosen = next((a for a in attempts if a.get("number") == report.get("published_attempt")), None)
-    chosen = chosen or (attempts[-1] if attempts else {})
+    return chosen or (attempts[-1] if attempts else {})
+
+
+def watermark_coverage(report: dict[str, Any]) -> float | None:
+    """Frames carrying a found layer, summed over layers, per video frame. A burned-in watermark sits on
+    (nearly) every frame; a subtitle line that holds still for a few seconds covers a small share."""
+    frames = (report.get("video") or {}).get("frames")
+    layers = published_attempt(report).get("layers") or []
+    present = [layer.get("present") for layer in layers if isinstance(layer, dict)]
+    if not isinstance(frames, int) or frames <= 0 or not present or not all(isinstance(v, int) for v in present):
+        return None
+    return sum(present) / frames
+
+
+def residuals_of(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """OCR hits wm_auto still saw in the attempt it published (frame numbers are the result's)."""
+    chosen = published_attempt(report)
     found = []
     for item in (chosen.get("ocr") or {}).get("residuals") or []:
         if isinstance(item, dict) and isinstance(item.get("frame"), int):
@@ -387,6 +403,13 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
         if problem:
             status = summary["status"] = "failed"
             summary["reason"] = problem
+    coverage = watermark_coverage(report)
+    if status == "complete" and coverage is not None and coverage < cfg.min_coverage:
+        # e.g. a subtitle that stayed put for 12 s was taken for a static mark and painted out.
+        status = summary["status"] = "needs_review"
+        summary["reason"] = (f"水印层只出现在 {coverage:.0%} 的帧里，可能把字幕或画面文字当成了水印；"
+                             "看截图：误判用 release 投原片，确有水印用 accept")
+        state["layers"] = [layer.get("label") for layer in published_attempt(report).get("layers") or []]
     if status == "complete":
         output = cfg.output_path(source, drama, number)
         keep_file(result, output)
@@ -399,8 +422,10 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
         candidate = cfg.candidate_path(source, drama, number)
         keep_file(result, candidate)
         residuals = residuals_of(report)
+        frames = (report.get("video") or {}).get("frames")
+        spots = residuals[:3] or ([{"frame": frames * k // 4} for k in (1, 2, 3)] if isinstance(frames, int) else [])
         shots = [snapshot(cfg, candidate, r, candidate.with_name(f"{candidate.stem}-f{r['frame']}.jpg"))
-                 for r in residuals[:3]]
+                 for r in spots]
         state.update(status=REVIEW, candidate=str(candidate), residuals=residuals[:10],
                      snapshots=[str(p) for p in shots if p])
         trim_job(job)

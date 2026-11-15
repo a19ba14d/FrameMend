@@ -91,6 +91,7 @@ CUDA_VISIBLE_DEVICES=1 ~/.venvs/framemend/bin/python wm_auto.py inputs/ runs/bat
   - 投稿会话已经用原片开始了：保持原片，因为 worker 拒绝换文件。
 - worker 发布去水印成品后，队列服务每 5 分钟读一次 worker 的回执，调用中台 `POST /api/v1/produced-submissions/{id}/dewatermark`。中台把视频记为「已去水印」，后台内容库显示徽标，Site API 返回 `dewatermarked`。标记成功 2 天后删除成品。原片仍由 `release-published.py` 按回执清理。
 - `needs_review`（OCR 复查仍认出文字，常见是把画面内容误认成字母）直接进入「待人工」，不再重跑：成品留在 `/srv/framemend/review/`，残留文字所在帧框好红框截图放在旁边，`framemend-ctl status` 会列出来。人看过没问题就 `accept`，投去水印成品。
+- 判成 `complete` 但所有水印层加起来只出现在不到一半的帧里（`min_coverage`，默认 0.5），也进「待人工」：真水印几乎每帧都在，这种多半是把停留几秒的字幕当成了静态水印、把字幕抹掉了。看截图后，误判用 `release` 投原片，确有水印用 `accept`。
 - `failed` 会加大掩码（`--dilation 8`）重试 1 次，仍失败就进入「待人工」。待人工的集继续压着不投。
 
 部署（在干净检出上，生产用 `main`）：`pipeline/deploy/deploy-02.sh main`。它会把代码装到 `/srv/framemend/app`，第一次部署时建 GPU 环境 `/srv/framemend/venv`，并装好 `framemend-queue.service` 和 `framemend-ctl`，但不会自动启用。配置文件是 `/srv/framemend/config.json`，样例见 `pipeline/deploy/config.example.json`；`enabled_sources` 决定哪些来源被拦下等待去水印。

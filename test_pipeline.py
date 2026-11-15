@@ -22,7 +22,14 @@ mode = Path(__file__).with_name("mode").read_text().strip()
 (job / "plan-01" / "big.bin").write_bytes(b"x" * 10)
 if mode == "complete":
     (job / "result.mp4").write_bytes(b"clean-" + src.read_bytes())
-    json.dump({"status": "complete", "result": str(job / "result.mp4")}, open(job / "auto.json", "w"))
+    json.dump({"status": "complete", "result": str(job / "result.mp4"), "video": {"frames": 100},
+               "attempts": [{"number": 1, "layers": [{"present": 60}, {"present": 45}]}]},
+              open(job / "auto.json", "w"))
+elif mode == "subtitle-only":
+    (job / "result.mp4").write_bytes(b"maybe-" + src.read_bytes())
+    json.dump({"status": "complete", "result": str(job / "result.mp4"), "video": {"frames": 1513},
+               "attempts": [{"number": 1, "layers": [{"kind": "static", "label": "x", "present": 315}]}]},
+              open(job / "auto.json", "w"))
 elif mode == "review-result":
     (job / "result.mp4").write_bytes(b"maybe-" + src.read_bytes())
     residual = {"frame": 12, "text": "A", "rect": [1, 2, 3, 4], "score": 0.7, "cause": "missed"}
@@ -210,6 +217,20 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(Path(review["snapshots"][0]).exists())
         self.assertEqual(fp.decide(self.cfg, args)[1][args.index("--source") + 1], state["output"])
         self.assertEqual(state["sha256"], fp.sha256(Path(state["output"])))
+
+    def test_low_coverage_complete_goes_to_review(self):
+        (self.app / "mode").write_text("subtitle-only")
+        with patch.object(fp, "output_matches", return_value=None), \
+                patch.object(fp, "snapshot", side_effect=lambda cfg, v, r, d: d.write_bytes(b"jpg") or d):
+            fp.queue_once(self.cfg)
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual(state["status"], fp.REVIEW)
+        self.assertIn("21%", state["attempts"][-1]["reason"])
+        self.assertEqual(len(state["snapshots"]), 3)
+        self.assertEqual(fp.release(self.cfg, "lizhi", "530", 1), 1)
+        self.assertFalse(Path(state["candidate"]).exists())
+        args = self.worker_args("530_Hot", "530", 1)
+        self.assertEqual(fp.decide(self.cfg, args)[1], args)
 
     def test_retry_drops_candidate_and_uses_wider_mask(self):
         (self.app / "mode").write_text("review-result")
