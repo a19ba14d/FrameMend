@@ -97,6 +97,8 @@ class Config:
         self.timeout = int(data.get("episode_timeout", 4 * 3600))
         self.retry_dilation = int(data.get("retry_dilation", 8))
         self.min_coverage = float(data.get("min_coverage", 0.5))
+        # Attempt 1 uses the default mask, later ones retry_dilation; after the last one nothing is held.
+        self.max_attempts = max(1, int(data.get("max_attempts", 2)))
         self.produced_jobs = Path(data.get("produced_jobs") or "/srv/produced/jobs")
         self.api_url = str(data.get("api_url", "")).rstrip("/")
         self.api_key_file = Path(data.get("api_key_file", "/srv/produced/produced.key"))
@@ -456,37 +458,46 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
             status = summary["status"] = "failed"
             summary["reason"] = problem
     coverage = watermark_coverage(report)
+    last_try = attempt >= cfg.max_attempts
     if status == "complete" and coverage is not None and coverage < cfg.min_coverage:
-        # e.g. a subtitle that stayed put for 12 s was taken for a static mark and painted out.
-        status = summary["status"] = "needs_review"
-        summary["reason"] = (f"水印层只出现在 {coverage:.0%} 的帧里，可能把字幕或画面文字当成了水印；"
-                             "看截图：误判用 release 投原片，确有水印用 accept")
+        # e.g. a subtitle that stayed put for 12 s was taken for a static mark and painted out. A wider
+        # mask would not change what was detected, so do not retry: submit the original right away.
+        status = summary["status"] = "low_coverage"
+        summary["reason"] = f"水印层只出现在 {coverage:.0%} 的帧里，可能把字幕或画面文字当成了水印，改投原片"
         state["layers"] = [layer.get("label") for layer in published_attempt(report).get("layers") or []]
-    if status == "complete":
+        state.update(status=RELEASED, auto_change="low_coverage_released")
+        trim_job(job)
+    elif status == "complete":
         output = cfg.output_path(source, drama, number)
         keep_file(result, output)
         state.update(status=COMPLETE, output=str(output), sha256=sha256(output),
                      size=output.stat().st_size, tool=cfg.tool, completed=now())
         trim_job(job)
+    elif status == "needs_review" and not last_try:
+        # wm_auto's OCR re-check still saw text: try again with the wider mask (retry_dilation).
+        state.update(status=PENDING)
+        trim_job(job)
     elif status == "needs_review":
-        # wm_auto's OCR re-check still saw text. That is often scenery read as a letter, so keep the
-        # result for a person to look at (accept / retry / release) instead of burning GPU on retries.
-        candidate = cfg.candidate_path(source, drama, number)
-        keep_file(result, candidate)
+        # Still some text after the wider mask too. The result is still far cleaner than the original,
+        # so submit it (and mark it) rather than hold the episode; keep the residual frames on record.
+        output = cfg.output_path(source, drama, number)
+        keep_file(result, output)
         residuals = residuals_of(report)
-        frames = (report.get("video") or {}).get("frames")
-        spots = residuals[:3] or ([{"frame": frames * k // 4} for k in (1, 2, 3)] if isinstance(frames, int) else [])
-        shots = [snapshot(cfg, candidate, r, candidate.with_name(f"{candidate.stem}-f{r['frame']}.jpg"))
-                 for r in spots]
-        state.update(status=REVIEW, candidate=str(candidate), residuals=residuals[:10],
-                     snapshots=[str(p) for p in shots if p])
+        cfg.candidate_path(source, drama, number).parent.mkdir(parents=True, exist_ok=True)
+        shots = [snapshot(cfg, output, r, cfg.candidate_path(source, drama, number).with_name(
+                     f"{number:04d}-f{r['frame']}.jpg")) for r in residuals[:3]]
+        state.update(status=COMPLETE, output=str(output), sha256=sha256(output), size=output.stat().st_size,
+                     tool=cfg.tool, completed=now(), auto_change="accepted_with_residuals",
+                     residuals=residuals[:10], snapshots=[str(p) for p in shots if p])
         trim_job(job)
     elif status == "no_watermark":
         state.update(status=NO_WATERMARK)
         trim_job(job)
+    elif not last_try:
+        state.update(status=PENDING)  # retry with the wider mask
     else:
-        # One retry with a wider mask, then wait for a person (the episode stays held).
-        state.update(status=PENDING if attempt < 2 else REVIEW)
+        # FrameMend keeps failing on this episode: let the original go out instead of holding it.
+        state.update(status=RELEASED, auto_change="failed_released")
     state.setdefault("attempts", []).append(summary)
     state["updated"] = now()
     write_json(state_path, state)

@@ -214,60 +214,62 @@ class PipelineTests(unittest.TestCase):
         self.cfg.source_min_size = {"lizhi": 10 ** 9}
         self.assertEqual(fp.candidates(self.cfg), [])
 
-    def test_failure_retries_once_then_waits_for_review(self):
+    def test_failure_retries_once_then_releases_original(self):
         (self.app / "mode").write_text("failed")
         fp.queue_once(self.cfg)
         self.assertEqual(fp.read_json(self.cfg.state_path("lizhi", "530", 1))["status"], fp.PENDING)
         fp.queue_once(self.cfg)
         state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
-        self.assertEqual(state["status"], fp.REVIEW)
+        self.assertEqual((state["status"], state["auto_change"]), (fp.RELEASED, "failed_released"))
         self.assertEqual(len(state["attempts"]), 2)
-        self.assertEqual([r["episode"] for r in fp.status(self.cfg)["review"]], ["lizhi:530:1"])
-        self.assertIsNone(fp.status(self.cfg)["review"][0]["candidate"])
-
-    def test_needs_review_keeps_result_for_accept(self):
-        (self.app / "mode").write_text("review-result")
-        with patch.object(fp, "output_matches", return_value=None), \
-                patch.object(fp, "snapshot", side_effect=lambda cfg, v, r, d: d.write_bytes(b"jpg") or d):
-            fp.queue_once(self.cfg)
-        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
-        self.assertEqual(state["status"], fp.REVIEW)
-        self.assertEqual(len(state["attempts"]), 1)  # no GPU retry for an OCR doubt
-        candidate = Path(state["candidate"])
-        self.assertTrue(candidate.read_bytes().startswith(b"maybe-"))
-        self.assertEqual(state["residuals"][0]["frame"], 12)
-        review = fp.status(self.cfg)["review"][0]
-        self.assertEqual(review["residuals"], ["帧12 「A」 0.7"])
-        self.assertEqual(len(review["snapshots"]), 1)
+        self.assertEqual(fp.status(self.cfg)["review"], [])
         args = self.worker_args("530_Hot", "530", 1)
-        self.assertIsNone(fp.decide(self.cfg, args)[1])
-        self.assertEqual(fp.accept(self.cfg, "lizhi", "530", 1), 1)
-        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
-        self.assertEqual((state["status"], state["operator_change"]), (fp.COMPLETE, "accepted"))
-        self.assertFalse(candidate.exists())
-        self.assertFalse(Path(review["snapshots"][0]).exists())
-        self.assertEqual(fp.decide(self.cfg, args)[1][args.index("--source") + 1], state["output"])
-        self.assertEqual(state["sha256"], fp.sha256(Path(state["output"])))
+        self.assertEqual(fp.decide(self.cfg, args)[1], args)  # nothing held: the original goes out
 
-    def test_low_coverage_complete_goes_to_review(self):
-        (self.app / "mode").write_text("subtitle-only")
+    def test_residual_text_retries_wider_then_submits_result(self):
+        (self.app / "mode").write_text("review-result")
+        args = self.worker_args("530_Hot", "530", 1)
         with patch.object(fp, "output_matches", return_value=None), \
-                patch.object(fp, "snapshot", side_effect=lambda cfg, v, r, d: d.write_bytes(b"jpg") or d):
+                patch.object(fp, "snapshot", side_effect=lambda cfg, v, r, d: (d.write_bytes(b"jpg"), d)[1]):
+            fp.queue_once(self.cfg)
+            state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+            self.assertEqual((state["status"], len(state["attempts"])), (fp.PENDING, 1))
+            self.assertIsNone(fp.decide(self.cfg, args)[1])  # held until the wider-mask retry ran
+            with patch.object(fp, "run_framemend", wraps=fp.run_framemend) as run:
+                fp.queue_once(self.cfg)
+            self.assertEqual(run.call_args.args[3], self.cfg.retry_dilation)
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual((state["status"], state["auto_change"]), (fp.COMPLETE, "accepted_with_residuals"))
+        self.assertTrue(Path(state["output"]).read_bytes().startswith(b"maybe-"))
+        self.assertEqual(state["sha256"], fp.sha256(Path(state["output"])))
+        self.assertEqual(state["residuals"][0]["frame"], 12)
+        self.assertEqual(len(state["snapshots"]), 1)
+        self.assertTrue(Path(state["snapshots"][0]).exists())
+        self.assertEqual(fp.status(self.cfg)["review"], [])
+        self.assertEqual(fp.decide(self.cfg, args)[1][args.index("--source") + 1], state["output"])
+
+    def test_low_coverage_releases_original_without_retry(self):
+        (self.app / "mode").write_text("subtitle-only")
+        with patch.object(fp, "output_matches", return_value=None), patch.object(fp, "snapshot", return_value=None):
             fp.queue_once(self.cfg)
         state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
-        self.assertEqual(state["status"], fp.REVIEW)
+        self.assertEqual((state["status"], state["auto_change"]), (fp.RELEASED, "low_coverage_released"))
+        self.assertEqual(len(state["attempts"]), 1)  # a wider mask would not change what was detected
         self.assertIn("21%", state["attempts"][-1]["reason"])
-        self.assertEqual(len(state["snapshots"]), 3)
-        self.assertEqual(fp.release(self.cfg, "lizhi", "530", 1), 1)
-        self.assertFalse(Path(state["candidate"]).exists())
+        self.assertNotIn("output", state)
         args = self.worker_args("530_Hot", "530", 1)
         self.assertEqual(fp.decide(self.cfg, args)[1], args)
 
-    def test_retry_drops_candidate_and_uses_wider_mask(self):
+    def test_retry_of_a_held_review_episode_drops_candidate_and_uses_wider_mask(self):
+        # Episodes held for review before automatic release existed can still be retried by hand.
         (self.app / "mode").write_text("review-result")
         with patch.object(fp, "output_matches", return_value=None), patch.object(fp, "snapshot", return_value=None):
             fp.queue_once(self.cfg)
-            candidate = Path(fp.read_json(self.cfg.state_path("lizhi", "530", 1))["candidate"])
+            path = self.cfg.state_path("lizhi", "530", 1)
+            candidate = self.cfg.candidate_path("lizhi", "530", 1)
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(b"old")
+            fp.write_json(path, {**fp.read_json(path), "status": fp.REVIEW, "candidate": str(candidate)})
             self.assertEqual(fp.set_state(self.cfg, "lizhi", "530", 1, fp.PENDING, (fp.REVIEW,)), 1)
             self.assertFalse(candidate.exists())
             with patch.object(fp, "run_framemend", wraps=fp.run_framemend) as run:
