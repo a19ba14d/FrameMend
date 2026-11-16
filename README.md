@@ -82,7 +82,7 @@ CUDA_VISIBLE_DEVICES=1 ~/.venvs/framemend/bin/python wm_auto.py inputs/ runs/bat
 
 `pipeline/framemend_pipeline.py` 把 `wm_auto.py` 接进 02 上的爬虫和成品投稿（produced-submit），按「去水印热度标准」只处理高热剧：
 
-- dupeguard 每 15 分钟给高热且未投稿的剧写 `.dewatermark`。`framemend-queue.service` 按热度（热度值 / 门槛）从高到低逐集跑 `wm_auto.py`（已经由 produced-submit 发布过的集跳过：dupeguard 投稿后不撤标记），成品放在 `/srv/framemend/out/`，每集的状态在 `/srv/framemend/state/`。不改爬虫目录。
+- dupeguard 每 15 分钟给高热且未投稿的剧写 `.dewatermark`。`framemend-queue.service` 按热度（热度值 / 门槛）从高到低逐集跑 `wm_auto.py`（已经由 produced-submit 发布过的集跳过：dupeguard 投稿后不撤标记；小于该来源投稿门槛 `source_min_size` 的集也跳过，它们本来就不会投），成品放在 `/srv/framemend/out/`，每集的状态在 `/srv/framemend/state/`。不改爬虫目录。
 - `/srv/framemend/bin/framemend-guard` 作为 `PRODUCED_WORKER`，包在真正的 produced-worker 外面：
   - 剧没有标记，或来源不在 `enabled_sources` 里：参数原样交给 worker。
   - 高热剧的集还没去完水印，或在等人工确认：返回 75。produced-submit 记一条 FAIL，下一轮用同样的参数重试，所以高热剧会一直等到去完水印再投。

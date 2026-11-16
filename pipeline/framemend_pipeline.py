@@ -90,6 +90,8 @@ class Config:
         # sources whose hot dramas are processed and held; guard passes every other source through untouched
         self.enabled = set(data.get("enabled_sources") or [])
         self.min_size = int(data.get("min_size", 300_000))
+        # Match each source's produced-submit PRODUCED_MIN_SIZE: smaller files are never submitted.
+        self.source_min_size = {k: int(v) for k, v in (data.get("source_min_size") or {}).items()}
         self.settle_seconds = int(data.get("settle_seconds", 600))
         self.timeout = int(data.get("episode_timeout", 4 * 3600))
         self.retry_dilation = int(data.get("retry_dilation", 8))
@@ -168,7 +170,7 @@ def hot_dramas(cfg: Config, source: str) -> Iterator[tuple[Path, str, float]]:
             yield drama, drama_id_of(drama), priority
 
 
-def episodes(cfg: Config, drama: Path) -> Iterator[tuple[int, Path]]:
+def episodes(cfg: Config, drama: Path, source: str = "") -> Iterator[tuple[int, Path]]:
     folder = drama / "episodes"
     if not folder.is_dir():
         return
@@ -181,7 +183,7 @@ def episodes(cfg: Config, drama: Path) -> Iterator[tuple[int, Path]]:
             stat = video.stat()
         except OSError:
             continue
-        if stat.st_size < cfg.min_size or now() - stat.st_mtime < cfg.settle_seconds:
+        if stat.st_size < cfg.source_min_size.get(source, cfg.min_size) or now() - stat.st_mtime < cfg.settle_seconds:
             continue
         yield number, video
 
@@ -221,7 +223,7 @@ def candidates(cfg: Config) -> list[tuple[float, str, str, int, Path]]:
     for source in sorted(cfg.enabled):
         published = published_originals(cfg, source)
         for drama, drama_id, priority in hot_dramas(cfg, source):
-            for number, video in episodes(cfg, drama):
+            for number, video in episodes(cfg, drama, source):
                 if str(video) in published:
                     continue
                 state = read_json(cfg.state_path(source, drama_id, number))

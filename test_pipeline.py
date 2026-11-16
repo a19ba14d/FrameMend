@@ -210,6 +210,10 @@ class PipelineTests(unittest.TestCase):
             (job / "receipt.json").write_text(json.dumps({"status": "published"}))
         self.assertEqual([c[3] for c in fp.candidates(self.cfg)], [1])
 
+    def test_source_min_size_matches_produced_submit(self):
+        self.cfg.source_min_size = {"lizhi": 10 ** 9}
+        self.assertEqual(fp.candidates(self.cfg), [])
+
     def test_failure_retries_once_then_waits_for_review(self):
         (self.app / "mode").write_text("failed")
         fp.queue_once(self.cfg)
