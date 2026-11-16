@@ -162,6 +162,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(fp.argument(execve.call_args[0][1], "--source"), str(output))
             self.assertTrue(self.cfg.binding_path("lizhi", "530", 1).is_file())
 
+    def test_guard_holds_resubmit_suffixed_identities(self):
+        args = self.worker_args("530_Hot", "530", 1)
+        metadata = Path(fp.argument(args, "--metadata"))
+        for identity in ("lizhi:530:1:full", "lizhi:530:1:r2"):
+            metadata.write_text(json.dumps({"sourceIdentity": identity}))
+            self.assertEqual(fp.decide(self.cfg, args)[0], "等待去水印")
+
     # ------------------------------------------------------------------ queue
 
     def test_normalize_skips_conforming_input_and_rewrites_vfr(self):
@@ -192,6 +199,16 @@ class PipelineTests(unittest.TestCase):
         (job / "job.json").write_text(json.dumps({"source": str(view)}))
         (job / "receipt.json").write_text(json.dumps({"status": "published"}))
         self.assertEqual([c[3] for c in fp.candidates(self.cfg)], [2])
+
+    def test_published_jobs_at_the_shared_jobs_root_count_too(self):
+        jobs = Path(self.cfg.produced_jobs)
+        for name, src, ep in (("mine", "lizhi", "02"), ("other", "chiguo", "01")):
+            job = jobs / name
+            job.mkdir(parents=True)
+            view = jobs / src / "ready-downloads" / "ai-duanju" / "530_Hot" / "episodes" / ep / "video.mp4"
+            (job / "job.json").write_text(json.dumps({"source": str(view)}))
+            (job / "receipt.json").write_text(json.dumps({"status": "published"}))
+        self.assertEqual([c[3] for c in fp.candidates(self.cfg)], [1])
 
     def test_failure_retries_once_then_waits_for_review(self):
         (self.app / "mode").write_text("failed")

@@ -196,13 +196,21 @@ def published_originals(cfg: Config, source: str) -> set[str]:
     if cached and now() - cached[0] < 300:
         return cached[1]
     found: set[str] = set()
-    root = cfg.produced_jobs / source
-    for job in root.glob("*/job.json") if root.is_dir() else []:
-        if read_json(job.with_name("receipt.json")).get("status") != "published":
+    downloads = cfg.sources[source]
+    # Most sources keep jobs under jobs/<source>/<hash>; chiguo's produced-submit writes jobs/<hash>.
+    jobs = [*(cfg.produced_jobs / source).glob("*/job.json"), *cfg.produced_jobs.glob("*/job.json")]
+    for job in jobs:
+        view = Path(str(read_json(job).get("source") or ""))
+        parts = view.parts
+        if "ready-downloads" in parts:  # jobs/<source>/ready-downloads/...: only this source's view
+            index = len(parts) - 1 - parts[::-1].index("ready-downloads")
+            if index == 0 or parts[index - 1] != source:
+                continue
+        elif not view.is_relative_to(downloads):
             continue
-        view = read_json(job).get("source")
-        if view:
-            found.add(str(original_for(cfg, source, Path(view))))
+        original = original_for(cfg, source, view)
+        if read_json(job.with_name("receipt.json")).get("status") == "published":
+            found.add(str(original))
     _published[source] = (now(), found)
     return found
 
@@ -569,10 +577,12 @@ def decide(cfg: Config, args: list[str]) -> tuple[str, list[str] | None, dict[st
     if not (source_arg and metadata_arg and work_arg):
         return "参数不完整，原样投稿", args, None
     identity = str(read_json(Path(metadata_arg)).get("sourceIdentity") or "")
+    # source:drama:episode, optionally followed by resubmit suffixes (chiguo's wrapper rewrites the
+    # metadata in place to ...:full / ...:r2, and a retried job keeps the rewritten file).
     parts = identity.split(":")
-    if len(parts) != 3 or parts[0] not in cfg.enabled or parts[0] not in cfg.sources:
+    if len(parts) < 3 or parts[0] not in cfg.enabled or parts[0] not in cfg.sources:
         return "来源未启用去水印", args, None
-    source, drama, episode_text = parts
+    source, drama, episode_text = parts[:3]
     try:
         number = int(episode_text)
     except ValueError:
