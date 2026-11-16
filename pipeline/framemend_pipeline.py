@@ -94,6 +94,7 @@ class Config:
         self.timeout = int(data.get("episode_timeout", 4 * 3600))
         self.retry_dilation = int(data.get("retry_dilation", 8))
         self.min_coverage = float(data.get("min_coverage", 0.5))
+        self.produced_jobs = Path(data.get("produced_jobs") or "/srv/produced/jobs")
         self.api_url = str(data.get("api_url", "")).rstrip("/")
         self.api_key_file = Path(data.get("api_key_file", "/srv/produced/produced.key"))
         version = (self.app / "VERSION").read_text().strip() if (self.app / "VERSION").is_file() else ""
@@ -185,12 +186,36 @@ def episodes(cfg: Config, drama: Path) -> Iterator[tuple[int, Path]]:
         yield number, video
 
 
+_published: dict[str, tuple[float, set[str]]] = {}
+
+
+def published_originals(cfg: Config, source: str) -> set[str]:
+    """Downloads produced-submit already published (its job.json source + a published receipt.json).
+    dupeguard never removes .dewatermark after submission, so most marked episodes went out long ago."""
+    cached = _published.get(source)
+    if cached and now() - cached[0] < 300:
+        return cached[1]
+    found: set[str] = set()
+    root = cfg.produced_jobs / source
+    for job in root.glob("*/job.json") if root.is_dir() else []:
+        if read_json(job.with_name("receipt.json")).get("status") != "published":
+            continue
+        view = read_json(job).get("source")
+        if view:
+            found.add(str(original_for(cfg, source, Path(view))))
+    _published[source] = (now(), found)
+    return found
+
+
 def candidates(cfg: Config) -> list[tuple[float, str, str, int, Path]]:
     """Hot episodes still waiting for FrameMend, hottest drama first, episodes in order."""
     found = []
     for source in sorted(cfg.enabled):
+        published = published_originals(cfg, source)
         for drama, drama_id, priority in hot_dramas(cfg, source):
             for number, video in episodes(cfg, drama):
+                if str(video) in published:
+                    continue
                 state = read_json(cfg.state_path(source, drama_id, number))
                 if state.get("status") in FINAL or state.get("status") == REVIEW:
                     continue

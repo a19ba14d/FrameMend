@@ -62,7 +62,9 @@ class PipelineTests(unittest.TestCase):
             "sources": {"lizhi": str(self.downloads), "chiguo": str(base / "crawler/chiguo/downloads")},
             "enabled_sources": ["lizhi"], "min_size": 10, "settle_seconds": 0,
             "api_url": "", "api_key_file": str(self.key), "tool": "framemend@abc1234",
+            "produced_jobs": str(base / "produced/jobs"),
         })
+        fp._published.clear()
         self.hot = self.make_drama("530_Hot", "530", hot={"field": "x", "value": 200, "threshold": 100})
         self.cold = self.make_drama("531_Cold", "531")
 
@@ -182,6 +184,14 @@ class PipelineTests(unittest.TestCase):
         job = self.cfg.job_dir("lizhi", "530", 1) / "attempt-01"
         self.assertEqual(sorted(p.name for p in job.iterdir()), ["auto.json"])
         self.assertFalse(fp.read_json(self.cfg.state_path("lizhi", "531", 1)))
+
+    def test_already_published_episodes_are_not_queued(self):
+        job = Path(self.cfg.produced_jobs) / "lizhi" / "abc"
+        job.mkdir(parents=True)
+        view = self.ready / "ai-duanju" / "530_Hot" / "episodes" / "01" / "video.mp4"
+        (job / "job.json").write_text(json.dumps({"source": str(view)}))
+        (job / "receipt.json").write_text(json.dumps({"status": "published"}))
+        self.assertEqual([c[3] for c in fp.candidates(self.cfg)], [2])
 
     def test_failure_retries_once_then_waits_for_review(self):
         (self.app / "mode").write_text("failed")
