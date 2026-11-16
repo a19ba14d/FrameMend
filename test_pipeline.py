@@ -334,6 +334,41 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("422", fp.read_json(self.cfg.binding_path("lizhi", "530", 2))["mark_error_final"])
         self.assertEqual(fp.mark_pending(self.cfg)["failed"], 0)
 
+    def test_mark_falls_back_to_job_receipt_after_worker_dir_cleanup(self):
+        calls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                calls.append(self.path)
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.cfg.api_url = f"http://127.0.0.1:{server.server_port}/api"
+
+        self.complete_state()
+        job = Path(self.tmp.name) / "produced-job"
+        _, _, binding = fp.decide(self.cfg, self.worker_args("530_Hot", "530", 1, work=job / "worker"))
+        fp.write_json(self.cfg.binding_path("lizhi", "530", 1), binding)
+        # worker/ is already gone; only the job's own files remain.
+        fp.write_json(job / "job.json", {"metadata": {"sourceIdentity": "lizhi:530:2"}})
+        fp.write_json(job / "receipt.json", {"id": 51, "videoId": 9, "status": "published"})
+        self.assertEqual(fp.mark_pending(self.cfg)["waiting"], 1)  # another episode's receipt is ignored
+        fp.write_json(job / "job.json", {"metadata": {"sourceIdentity": "lizhi:530:1:r2"}})
+        self.assertEqual(fp.mark_pending(self.cfg)["marked"], 1)
+        self.assertEqual(calls, ["/api/v1/produced-submissions/51/dewatermark"])
+        saved = fp.read_json(self.cfg.binding_path("lizhi", "530", 1))
+        self.assertEqual((saved["submission_id"], saved["video_id"]), (51, 9))
+
     def test_cleanup_drops_outputs_after_keep_window(self):
         output = self.complete_state()
         fp.write_json(self.cfg.binding_path("lizhi", "530", 1),

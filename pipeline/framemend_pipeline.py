@@ -664,10 +664,20 @@ def post_mark(cfg: Config, submission_id: int, tool: str, digest: str) -> tuple[
 
 
 def published_receipt(binding: dict[str, Any]) -> dict[str, Any] | None:
-    for session in worker_states(Path(binding.get("work_dir", ""))):
+    work_dir = Path(binding.get("work_dir", ""))
+    for session in worker_states(work_dir):
         if session.get("source") != binding.get("output"):
             continue
         receipt = session.get("receipt") or {}
+        if receipt.get("status") == "published" and int(receipt.get("id") or 0) > 0:
+            return receipt
+    # The produced pipeline deletes <job>/worker once the episode is published, often before the
+    # queue's next pass, but keeps <job>/receipt.json. That receipt has no recipe, so the source
+    # digest is checked by MediaCMS instead (422 when the original was what got published).
+    job = work_dir.parent
+    identity = str((read_json(job / "job.json").get("metadata") or {}).get("sourceIdentity") or "")
+    if binding.get("identity") and identity.split(":")[:3] == str(binding["identity"]).split(":")[:3]:
+        receipt = read_json(job / "receipt.json")
         if receipt.get("status") == "published" and int(receipt.get("id") or 0) > 0:
             return receipt
     return None
