@@ -22,6 +22,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -104,6 +105,10 @@ class Config:
         self.keep_days = float(data.get("keep_days", 2))
         self.ffprobe = str(data.get("ffprobe") or shutil.which("ffprobe") or "ffprobe")
         self.ffmpeg = str(data.get("ffmpeg") or shutil.which("ffmpeg") or "ffmpeg")
+        # Extra GPU machines driven over ssh by their own queue process on this host (see run_remote):
+        # {"dell": {"ssh": ["ssh", "-i", "...", "user@host"], "wsl": "Ubuntu-24.04"}}
+        self.remote_workers: dict[str, dict[str, Any]] = {
+            k: v for k, v in (data.get("remote_workers") or {}).items() if isinstance(v, dict) and v.get("ssh")}
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":
@@ -417,7 +422,8 @@ def drop_candidate(state: dict[str, Any]) -> None:
     state.pop("residuals", None)
 
 
-def process_episode(cfg: Config, source: str, drama: str, number: int, video: Path) -> dict[str, Any]:
+def process_episode(cfg: Config, source: str, drama: str, number: int, video: Path,
+                    worker: str = "local") -> dict[str, Any]:
     state_path = cfg.state_path(source, drama, number)
     state = read_json(state_path) or {"source": source, "drama": drama, "episode": number, "attempts": []}
     attempt = len(state.get("attempts", [])) + 1
@@ -425,12 +431,23 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
     if job.exists():
         shutil.rmtree(job)
     drop_candidate(state)
-    state.update(status=PENDING, original=str(video), running=attempt, updated=now())
+    state.update(status=PENDING, original=str(video), running=attempt, worker=worker, updated=now())
     write_json(state_path, state)
-    report = run_framemend(cfg, video, job, cfg.retry_dilation if attempt > 1 else None)
+    dilation = cfg.retry_dilation if attempt > 1 else None
+    try:
+        if worker == "local":
+            report = run_framemend(cfg, video, job, dilation)
+        else:
+            report = run_remote(cfg, worker, video, job, dilation)
+    except RemoteUnavailable:
+        # The machine or link failed, not the episode: leave it for the next pass without using up an attempt.
+        state.pop("running", None)
+        state["updated"] = now()
+        write_json(state_path, state)
+        raise
     status = report["status"]
     summary = {"attempt": attempt, "status": status, "reason": report.get("reason") or report.get("error"),
-               "seconds": report.get("wall_seconds"), "exit_code": report.get("exit_code")}
+               "seconds": report.get("wall_seconds"), "exit_code": report.get("exit_code"), "worker": worker}
     state.pop("running", None)
     result = Path(report.get("result") or job / "result.mp4").resolve()
     if status in ("complete", "needs_review"):
@@ -477,9 +494,12 @@ def process_episode(cfg: Config, source: str, drama: str, number: int, video: Pa
     return state
 
 
-def queue_once(cfg: Config) -> bool:
-    """Process at most one episode. Returns True when something was processed."""
-    if cfg.paused:
+def queue_once(cfg: Config, worker: str = "local") -> bool:
+    """Process at most one episode. Returns True when something was processed.
+
+    Several queue processes (this host's GPU plus one per remote worker) share the candidate list; the
+    per-episode lock keeps them on different episodes, so a drama's episodes finish side by side."""
+    if cfg.paused or (worker != "local" and worker not in cfg.remote_workers):
         return False
     for _priority, source, drama, number, video in candidates(cfg):
         with locked(cfg.root / "locks" / f"{safe_part(source)}-{safe_part(drama)}-{number:04d}.lock") as ok:
@@ -488,7 +508,7 @@ def queue_once(cfg: Config) -> bool:
             state = read_json(cfg.state_path(source, drama, number))
             if state.get("status") in FINAL or state.get("status") == REVIEW:
                 continue
-            process_episode(cfg, source, drama, number, video)
+            process_episode(cfg, source, drama, number, video, worker)
             return True
     return False
 
@@ -511,26 +531,141 @@ class locked:
             self.handle.close()
 
 
-def queue_loop(cfg_path: str | None, once: bool) -> int:
-    with locked(Config.load(cfg_path).root / "queue.lock") as ok:
+def queue_loop(cfg_path: str | None, once: bool, worker: str = "local") -> int:
+    lock_name = "queue.lock" if worker == "local" else f"queue-{safe_part(worker)}.lock"
+    with locked(Config.load(cfg_path).root / lock_name) as ok:
         if not ok:
-            log("another queue is running")
+            log("another queue is running", worker=worker)
             return 0
         last_mark = 0.0
         while True:
             cfg = Config.load(cfg_path)  # pick up enabled_sources / pause edits without a restart
-            if now() - last_mark > 300:
+            if worker == "local" and now() - last_mark > 300:
                 try:
                     mark_pending(cfg)
                     cleanup(cfg)
                 except Exception as error:  # marking must never stop the GPU queue
                     log("mark/cleanup failed", error=str(error))
                 last_mark = now()
-            worked = queue_once(cfg)
+            try:
+                worked = queue_once(cfg, worker)
+            except RemoteUnavailable as error:
+                log("remote worker unavailable", worker=worker, error=str(error)[:300])
+                if once:
+                    return 1
+                time.sleep(300)
+                continue
             if once:
                 return 0
             if not worked:
                 time.sleep(60)
+
+
+# --------------------------------------------------------------------------------------------- remote
+
+class RemoteUnavailable(Exception):
+    """ssh / transfer / remote setup failed; the episode itself was not judged."""
+
+
+REMOTE_REL = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
+
+
+def remote_command(cfg: Config, worker: str, *args: str) -> list[str]:
+    spec = cfg.remote_workers[worker]
+    # The remote side logs into Windows cmd (as 02 does): no shell quoting, every token is plain.
+    return [*spec["ssh"], "wsl.exe", "-d", str(spec.get("wsl") or "Ubuntu-24.04"), "-u", "root", "--",
+            "/usr/bin/python3", "-I", str(spec.get("app") or "/srv/framemend/app") + "/pipeline/framemend_pipeline.py",
+            "remote", *args]
+
+
+def remote_call(cfg: Config, worker: str, *args: str, stdin: Any = None, stdout: Any = subprocess.PIPE,
+                timeout: float = 600) -> bytes:
+    try:
+        done = subprocess.run(remote_command(cfg, worker, *args), stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                              stdout=stdout, stderr=subprocess.PIPE, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RemoteUnavailable(f"{worker} {args[0]}: {error}") from error
+    if done.returncode != 0:
+        raise RemoteUnavailable(f"{worker} {args[0]} exit {done.returncode}: "
+                                f"{(done.stderr or b'')[-300:].decode(errors='replace')}")
+    return done.stdout or b""
+
+
+def run_remote(cfg: Config, worker: str, video: Path, job: Path, dilation: int | None) -> dict[str, Any]:
+    """run_framemend on another machine: send the original, run wm_auto there, fetch the result back."""
+    rel = job.relative_to(cfg.root / "jobs").as_posix()
+    started = now()
+    job.mkdir(parents=True, exist_ok=True)
+    try:
+        with video.open("rb") as handle:
+            remote_call(cfg, worker, "put", rel, stdin=handle, timeout=3600)
+        if remote_call(cfg, worker, "sha", rel).decode().strip() != sha256(video):
+            raise RemoteUnavailable(f"{worker}: 原片传输后摘要不一致")
+        raw = remote_call(cfg, worker, "run", rel, str(dilation or 0), timeout=cfg.timeout + 900)
+        try:
+            report = json.loads(raw.decode())
+        except ValueError as error:
+            raise RemoteUnavailable(f"{worker}: 远程报告无法解析") from error
+        with (job.parent / f"{job.name}.log").open("ab") as handle:
+            remote_call(cfg, worker, "log", rel, stdout=handle)
+        digest = report.pop("result_sha256", None)
+        report.pop("result", None)
+        if digest:
+            result = job / "result.mp4"
+            with result.open("wb") as handle:
+                remote_call(cfg, worker, "get", rel, stdout=handle, timeout=3600)
+            if sha256(result) != digest:
+                raise RemoteUnavailable(f"{worker}: 成品传回后摘要不一致")
+            report["result"] = str(result)
+    finally:
+        try:
+            remote_call(cfg, worker, "rm", rel, timeout=300)
+        except RemoteUnavailable as error:
+            log("remote cleanup failed", worker=worker, error=str(error)[:200])
+    write_json(job / "auto.json", report)
+    report["wall_seconds"] = round(now() - started, 1)
+    return report
+
+
+def remote_serve(cfg: Config, action: str, rel: str, extra: list[str]) -> int:
+    """The far end of run_remote, run on the GPU machine. Everything lives under <root>/remote/<rel>."""
+    if not REMOTE_REL.match(rel) or ".." in rel.split("/"):
+        print("bad path", file=sys.stderr)
+        return 2
+    base = cfg.root / "remote" / rel
+    source, job, result = base / "input.mp4", base / "job", base / "result.mp4"
+    out = sys.stdout.buffer
+    if action == "put":
+        base.mkdir(parents=True, exist_ok=True)
+        partial = base / "input.part"
+        with partial.open("wb") as handle:
+            shutil.copyfileobj(sys.stdin.buffer, handle, 1 << 22)
+        os.replace(partial, source)
+    elif action == "sha":
+        out.write((sha256(source) + "\n").encode())
+    elif action == "run":
+        dilation = int(extra[0]) if extra and extra[0].isdigit() and int(extra[0]) > 0 else None
+        shutil.rmtree(job, ignore_errors=True)
+        result.unlink(missing_ok=True)
+        report = run_framemend(cfg, source, job, dilation)
+        produced = Path(report.get("result") or job / "result.mp4")
+        if report.get("status") in ("complete", "needs_review") and produced.is_file():
+            keep_file(produced, result)
+            report["result_sha256"] = sha256(result)
+        out.write(json.dumps(report, ensure_ascii=False).encode())
+    elif action == "get":
+        with result.open("rb") as handle:
+            shutil.copyfileobj(handle, out, 1 << 22)
+    elif action == "log":
+        log_file = base / "job.log"
+        if log_file.is_file():
+            out.write(log_file.read_bytes())
+    elif action == "rm":
+        shutil.rmtree(base, ignore_errors=True)
+    else:
+        return 2
+    out.flush()
+    return 0
 
 
 # --------------------------------------------------------------------------------------------- guard
@@ -794,7 +929,10 @@ def status(cfg: Config) -> dict[str, Any]:
         "queued": len(waiting),
         "queued_by_source": {s: sum(1 for c in waiting if c[1] == s) for s in sorted(cfg.enabled)},
         "average_seconds": round(average, 1) if average else None,
-        "eta_hours": round(len(waiting) * average / 3600, 1) if average else None,
+        "workers": ["local", *sorted(cfg.remote_workers)],
+        "running": [f"{s.get('source')}:{s.get('drama')}:{s.get('episode')}@{s.get('worker', 'local')}"
+                    for _p, s in all_states(cfg) if s.get("running")],
+        "eta_hours": round(len(waiting) * average / 3600 / (1 + len(cfg.remote_workers)), 1) if average else None,
         "review": review[:50],
         "marks": marks,
     }
@@ -872,6 +1010,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     queue = sub.add_parser("queue", help="常驻：按热度逐集去水印")
     queue.add_argument("--once", action="store_true")
+    queue.add_argument("--worker", default="local", help="local 用本机 GPU；其他名字取 config 的 remote_workers")
+    remote = sub.add_parser("remote", help="（GPU 机上由 ssh 调用）put|sha|run|get|log|rm <相对路径> [扩张]")
+    remote.add_argument("action")
+    remote.add_argument("rel")
+    remote.add_argument("extra", nargs="*")
     sub.add_parser("mark", help="给已发布的去水印成品在中台打标记")
     sub.add_parser("status")
     sub.add_parser("cleanup")
@@ -885,8 +1028,10 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("episode", nargs="?", type=int)
     args = parser.parse_args(raw)
     if args.command == "queue":
-        return queue_loop(args.config, args.once)
+        return queue_loop(args.config, args.once, args.worker)
     cfg = Config.load(args.config)
+    if args.command == "remote":
+        return remote_serve(cfg, args.action, args.rel, args.extra)
     if args.command == "mark":
         result: Any = mark_pending(cfg)
     elif args.command == "status":

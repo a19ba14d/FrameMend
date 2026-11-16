@@ -13,6 +13,7 @@
   "episode_timeout": 14400,
   "retry_dilation": 8,
   "keep_days": 2,
+  "remote_workers": {},
   "sources": {
     "badnews": "/srv/crawler/badnews/downloads",
     "chengguo": "/srv/crawler/chengguo/downloads",

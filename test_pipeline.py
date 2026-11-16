@@ -369,6 +369,66 @@ class PipelineTests(unittest.TestCase):
         saved = fp.read_json(self.cfg.binding_path("lizhi", "530", 1))
         self.assertEqual((saved["submission_id"], saved["video_id"]), (51, 9))
 
+    # ------------------------------------------------------------------ remote GPU worker
+
+    def remote_setup(self):
+        """A fake 'ssh' that drops the host + wsl.exe prefix and runs the command here against a separate root."""
+        base = Path(self.tmp.name)
+        far = base / "far"
+        far.mkdir()
+        probe = base / "fake-ffprobe"
+        probe.write_text("#!%s\nimport json\nprint(json.dumps({'streams': [{'pix_fmt': 'yuv420p', 'width': 2, "
+                         "'height': 2, 'r_frame_rate': '30/1', 'avg_frame_rate': '30/1', 'nb_frames': '9'}]}))\n"
+                         % sys.executable)
+        probe.chmod(0o755)
+        far_config = base / "far-config.json"
+        far_config.write_text(json.dumps({"root": str(far), "app": str(self.app), "python": sys.executable,
+                                          "ffprobe": str(probe), "ffmpeg": "ffmpeg"}))
+        ssh = base / "fake-ssh"
+        ssh.write_text(
+            "#!%s\nimport os, sys\nargs = sys.argv[sys.argv.index('--') + 1:]\nargs[0] = %r\n"
+            "os.environ['FRAMEMEND_CONFIG'] = %r\nos.execv(args[0], args)\n"
+            % (sys.executable, sys.executable, str(far_config)))
+        ssh.chmod(0o755)
+        repo = Path(__file__).resolve().parent
+        self.cfg.remote_workers = {"dell": {"ssh": [str(ssh), "dell"], "app": str(repo)}}
+        return far
+
+    def test_remote_worker_processes_episode_and_brings_result_back(self):
+        far = self.remote_setup()
+        with patch.object(fp, "output_matches", return_value=None):
+            self.assertTrue(fp.queue_once(self.cfg, "dell"))
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual(state["status"], fp.COMPLETE)
+        self.assertEqual(state["attempts"][-1]["worker"], "dell")
+        self.assertNotIn("running", state)
+        self.assertEqual(Path(state["output"]).read_bytes(), b"clean-original-video-1")
+        self.assertEqual(state["sha256"], fp.sha256(Path(state["output"])))
+        job = self.cfg.job_dir("lizhi", "530", 1)
+        self.assertEqual(fp.read_json(job / "attempt-01" / "auto.json")["status"], "complete")
+        self.assertTrue((job / "attempt-01.log").is_file())
+        self.assertEqual(list((far / "remote").rglob("*.mp4")), [])  # nothing left on the GPU machine
+        # the local queue skips the episode the remote one finished and takes the next
+        with patch.object(fp, "output_matches", return_value=None):
+            self.assertTrue(fp.queue_once(self.cfg))
+        self.assertEqual(fp.read_json(self.cfg.state_path("lizhi", "530", 2))["attempts"][-1]["worker"], "local")
+
+    def test_remote_failure_does_not_use_up_an_attempt(self):
+        self.cfg.remote_workers = {"dell": {"ssh": ["false"]}}
+        with self.assertRaises(fp.RemoteUnavailable):
+            fp.queue_once(self.cfg, "dell")
+        state = fp.read_json(self.cfg.state_path("lizhi", "530", 1))
+        self.assertEqual((state["status"], state["attempts"]), (fp.PENDING, []))
+        self.assertNotIn("running", state)
+        self.assertEqual([c[3] for c in fp.candidates(self.cfg)][:1], [1])
+
+    def test_unknown_remote_worker_does_nothing(self):
+        self.assertFalse(fp.queue_once(self.cfg, "nobody"))
+
+    def test_remote_serve_rejects_paths_outside_its_root(self):
+        self.assertEqual(fp.remote_serve(self.cfg, "rm", "../x", []), 2)
+        self.assertEqual(fp.remote_serve(self.cfg, "rm", "a/../../x", []), 2)
+
     def test_cleanup_drops_outputs_after_keep_window(self):
         output = self.complete_state()
         fp.write_json(self.cfg.binding_path("lizhi", "530", 1),

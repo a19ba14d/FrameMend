@@ -1,0 +1,19 @@
+[Unit]
+Description=FrameMend 去水印队列：用远程 GPU 机 %i（config.json 的 remote_workers.%i）
+After=network-online.target framemend-queue.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FRAMEMEND_CONFIG=/srv/framemend/config.json
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -I /srv/framemend/app/pipeline/framemend_pipeline.py queue --worker %i
+Restart=on-failure
+RestartSec=30
+Nice=10
+UMask=0077
+StandardOutput=append:/var/log/framemend-queue-%i.log
+StandardError=append:/var/log/framemend-queue-%i.log
+
+[Install]
+WantedBy=multi-user.target

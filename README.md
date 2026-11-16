@@ -114,6 +114,18 @@ framemend-ctl release lizhi 530 [3]     # 人工确认后让待处理的集改�
 framemend-ctl retry lizhi 530 [3]       # 待人工的集加大掩码重新排队
 ```
 
+多一台 GPU 机（例如 dell）：
+
+1. 先用 `FRAMEMEND_HOST=dell pipeline/deploy/deploy-02.sh main` 把同一版本装到那台机器。它的队列单元不要启用。
+2. 在 02 的 `config.json` 里加 `"remote_workers": {"dell": {"ssh": ["ssh", "-o", "BatchMode=yes", "-i", "/root/.ssh/framemend_dell", "dell@<IP>"]}}`。
+3. 启用 `framemend-queue-remote@dell`。
+
+工作方式：
+
+- 这个进程跑在 02 上，和本机队列共用候选列表，靠每集一把锁分开，各处理不同的集。
+- 每集的流程是：原片经 ssh 传到对方的 `/srv/framemend/remote/`，在对方跑 `wm_auto`，成品和报告传回 02。两个方向都校验 sha256，对方机器上不留文件。状态、复核、标记仍然都在 02 上。
+- ssh 或传输出错时，这一集不算失败、不消耗重试次数，该进程过 5 分钟再试。
+
 回滚：恢复 `produced-<源>-local.sh` 的备份，或者把该来源从 `enabled_sources` 里去掉（guard 会立即放行），然后 `systemctl disable --now framemend-queue`。
 
 ## 命令与测试

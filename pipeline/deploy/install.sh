@@ -19,6 +19,7 @@ WATERMARK_VENV=$root/venv WATERMARK_TOOLS_DIR=$root/tools bash "$root/app/setup.
 install -m 755 "$root/app/pipeline/deploy/framemend-guard" "$root/bin/framemend-guard"
 install -m 755 "$root/app/pipeline/deploy/framemend-ctl" /usr/local/bin/framemend-ctl
 install -m 644 "$root/app/pipeline/deploy/framemend-queue.service" /etc/systemd/system/framemend-queue.service
+install -m 644 "$root/app/pipeline/deploy/framemend-queue-remote@.service" "/etc/systemd/system/framemend-queue-remote@.service"
 [[ -f $root/config.json ]] || install -m 600 "$root/app/pipeline/deploy/config.example.json" "$root/config.json"
 systemctl daemon-reload
 echo "FrameMend $version installed at $root/app; queue unit installed (enable with: systemctl enable --now framemend-queue)"
